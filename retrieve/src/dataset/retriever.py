@@ -1,3 +1,66 @@
+# ########################################
+# # Optimal Subgraph Gold 標註法具體實現
+# # 1. 限制長度內所有路徑 (All Paths within a Length Threshold)
+# def all_paths_within_length(nx_g, q_entity_id_list, a_entity_id_list, max_length=3):
+#     """
+#     取得所有主題實體到答案實體間，長度不超過 max_length 的所有路徑
+#     Returns: List[List[entity_id]]
+#     """
+#     path_list_ = []
+#     for q_entity_id in q_entity_id_list:
+#         for a_entity_id in a_entity_id_list:
+#             try:
+#                 # networkx.all_simple_paths 支援 cutoff 參數
+#                 paths = list(nx.all_simple_paths(nx_g, q_entity_id, a_entity_id, cutoff=max_length))
+#                 path_list_.extend(paths)
+#             except:
+#                 continue
+#     return path_list_
+
+# # 2. 隨機遊走子圖 (Random Walk-based Subgraph)
+# import random
+
+# def random_walk_paths(nx_g, q_entity_id_list, a_entity_id_list, num_walks=20, walk_length=4):
+#     """
+#     以主題實體為起點，進行多次隨機遊走，收集能到達答案的路徑
+#     Returns: List[List[entity_id]]
+#     """
+#     path_list_ = []
+#     for q_entity_id in q_entity_id_list:
+#         for _ in range(num_walks):
+#             path = [q_entity_id]
+#             current = q_entity_id
+#             for _ in range(walk_length):
+#                 neighbors = list(nx_g.successors(current))
+#                 if not neighbors:
+#                     break
+#                 next_node = random.choice(neighbors)
+#                 path.append(next_node)
+#                 current = next_node
+#                 if current in a_entity_id_list:
+#                     path_list_.append(path.copy())
+#                     break
+#     return path_list_
+
+# # 3. Personalized PageRank 子圖 (Personalized PageRank Subgraph)
+# def pagerank_topk_edges(nx_g, q_entity_id_list, topk=10):
+#     """
+#     以主題實體為 seed，計算 Personalized PageRank，取分數最高的 topk 條邊
+#     Returns: List[Tuple(h_id, t_id)]
+#     """
+#     # 多個主題實體平均分配權重
+#     personalization = {n: 0 for n in nx_g.nodes()}
+#     for q in q_entity_id_list:
+#         personalization[q] = 1  # 將 float 改為 int，避免 linter 錯誤
+#     pr = nx.pagerank(nx_g, personalization=personalization)
+#     # 取分數最高的 topk 節點，然後找出這些節點相關的邊
+#     top_nodes = sorted(pr, key=pr.get, reverse=True)[:topk]
+#     edge_set = set()
+#     for h in top_nodes:
+#         for t in nx_g.successors(h):
+#             edge_set.add((h, t))
+#     return list(edge_set)
+# ########################################
 import networkx as nx
 import numpy as np
 import os
@@ -5,7 +68,7 @@ import pickle
 import torch
 import torch.nn.functional as F
 
-from tqdm import tqdm
+# from tqdm import tqdm  # 移除 tqdm
 
 class RetrieverDataset:
     def __init__(
@@ -15,19 +78,23 @@ class RetrieverDataset:
         skip_no_path=True
     ):
         # Load pre-processed data.
+        # 載入預先處理好的資料
         dataset_name = config['dataset']['name']
         processed_dict_list = self._load_processed(dataset_name, split)
 
         # Extract directed shortest paths from topic entities to answer
         # entities or vice versa as weak supervision signals for triple scoring.
+        # 從主題實體到答案實體（或反向）提取有向最短路徑，作為三元組評分的弱監督訊號
         triple_score_dict = self._get_triple_scores(
             dataset_name, split, processed_dict_list)
 
         # Load pre-computed embeddings.
+        # 載入預先計算好的嵌入向量
         emb_dict = self._load_emb(
             dataset_name, config['dataset']['text_encoder_name'], split)
 
         # Put everything together.
+        # 將所有資料組合起來
         self._assembly(
             processed_dict_list, triple_score_dict, emb_dict, skip_no_path)
 
@@ -36,6 +103,7 @@ class RetrieverDataset:
         dataset_name,
         split
     ):
+        # 載入已處理的資料檔案
         processed_file = os.path.join(
             f'data_files/{dataset_name}/processed/{split}.pkl')
         with open(processed_file, 'rb') as f:
@@ -47,6 +115,7 @@ class RetrieverDataset:
         split,
         processed_dict_list
     ):
+        # 取得三元組分數，若已存在則直接載入，否則計算後儲存
         save_dir = os.path.join('data_files', dataset_name, 'triple_scores')
         os.makedirs(save_dir, exist_ok=True)
         save_file = os.path.join(save_dir, f'{split}.pth')
@@ -55,7 +124,7 @@ class RetrieverDataset:
             return torch.load(save_file)
 
         triple_score_dict = dict()
-        for i in tqdm(range(len(processed_dict_list))):
+        for i in range(len(processed_dict_list)):
             sample_i = processed_dict_list[i]
             sample_i_id = sample_i['id']
             triple_scores_i, max_path_length_i = self._extract_paths_and_score(
@@ -74,6 +143,7 @@ class RetrieverDataset:
         self,
         sample
     ):
+        # 取得 networkx 圖物件
         nx_g = self._get_nx_g(
             sample['h_id_list'],
             sample['r_id_list'],
@@ -81,24 +151,32 @@ class RetrieverDataset:
         )
 
         # Each raw path is a list of entity IDs.
+        # 每條原始路徑是一串實體 ID
         path_list_ = []
         for q_entity_id in sample['q_entity_id_list']:
             for a_entity_id in sample['a_entity_id_list']:
                 paths_q_a = self._shortest_path(nx_g, q_entity_id, a_entity_id)
+                ##############################################################
+                # paths_q_a = pagerank_topk_edges(nx_g, q_entity_id, topk=10)
+                # paths_q_a = random_walk_paths(nx_g, q_entity_id, a_entity_id)
+                # paths_q_a = all_paths_within_length(nx_g, q_entity_id, a_entity_id, max_length=3)
+                ##############################################################
                 if len(paths_q_a) > 0:
                     path_list_.extend(paths_q_a)
 
         if len(path_list_) == 0:
-            max_path_length = None
+            max_path_length = None  # 沒有路徑
         else:
-            max_path_length = 0
+            max_path_length = 0  # 有路徑，初始化最大長度
 
         # Each processed path is a list of triple IDs.
+        # 每條處理後的路徑是一串三元組 ID
         path_list = []
 
         for path in path_list_:
             num_triples_path = len(path) - 1
-            max_path_length = max(max_path_length, num_triples_path)
+            # 取最大路徑長度，若 max_path_length 為 None 則設為 num_triples_path
+            max_path_length = max(num_triples_path, max_path_length) if max_path_length is not None else num_triples_path
             triples_path = []
 
             for i in range(num_triples_path):
@@ -125,6 +203,7 @@ class RetrieverDataset:
         r_id_list,
         t_id_list
     ):
+        # 建立 networkx 有向圖，節點為實體，邊為三元組
         nx_g = nx.DiGraph()
         num_triples = len(h_id_list)
         for i in range(num_triples):
@@ -141,6 +220,7 @@ class RetrieverDataset:
         q_entity_id,
         a_entity_id
     ):
+        # 嘗試找正向與反向的最短路徑
         try:
             forward_paths = list(nx.all_shortest_paths(nx_g, q_entity_id, a_entity_id))
         except:
@@ -168,6 +248,7 @@ class RetrieverDataset:
         path_list,
         num_triples
     ):
+        # 根據路徑標記三元組分數
         triple_scores = torch.zeros(num_triples)
         
         for path in path_list:
@@ -182,6 +263,7 @@ class RetrieverDataset:
         text_encoder_name,
         split
     ):
+        # 載入嵌入向量檔案
         file_path = f'data_files/{dataset_name}/emb/{text_encoder_name}/{split}.pth'
         dict_file = torch.load(file_path)
         
@@ -194,11 +276,12 @@ class RetrieverDataset:
         emb_dict,
         skip_no_path,
     ):
+        # 組合所有資料，並處理每個樣本
         self.processed_dict_list = []
 
         num_relevant_triples = []
         num_skipped = 0
-        for i in tqdm(range(len(processed_dict_list))):
+        for i in range(len(processed_dict_list)):
             sample_i = processed_dict_list[i]
             sample_i_id = sample_i['id']
             assert sample_i_id in triple_score_dict
@@ -222,6 +305,7 @@ class RetrieverDataset:
             sample_i['a_entity_id_list'] = list(set(sample_i['a_entity_id_list']))
 
             # PE for topic entities.
+            # 主題實體的 positional encoding
             num_entities_i = len(sample_i['text_entity_list']) + len(sample_i['non_text_entity_list'])
             topic_entity_mask = torch.zeros(num_entities_i)
             topic_entity_mask[sample_i['q_entity_id_list']] = 1.
@@ -238,12 +322,15 @@ class RetrieverDataset:
         print(f'# relevant triples | median: {median_num_relevant} | mean: {mean_num_relevant} | max: {max_num_relevant}')
 
     def __len__(self):
+        # 回傳資料集長度
         return len(self.processed_dict_list)
     
     def __getitem__(self, i):
+        # 取得第 i 筆資料
         return self.processed_dict_list[i]
 
 def collate_retriever(data):
+    # 將多筆資料組合成 batch，回傳 tensor 與必要欄位
     sample = data[0]
     
     h_id_list = sample['h_id_list']

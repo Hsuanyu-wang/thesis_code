@@ -2,3 +2,7 @@
 wandb
 *.pth
 retrieve/data_files
+ori_data
+retrieve_result
+train_result
+results

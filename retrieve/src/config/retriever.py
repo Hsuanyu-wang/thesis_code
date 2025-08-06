@@ -26,10 +26,22 @@ class RetrieverExpYaml(pydantic.BaseModel):
     patience: int
     save_prefix: str
 
+class KGEYaml(pydantic.BaseModel):
+    enabled: bool = False
+    model_type: str = 'transe'
+    embedding_dim: int = 256
+    num_epochs: int = 100
+    batch_size: int = 1024
+    learning_rate: float = 0.001
+    margin: float = 1.0
+    num_negatives: int = 1
+    norm: int = 1
+
 class RetrieverTrainYaml(pydantic.BaseModel):
     env: EnvYaml
     dataset: DatasetYaml
     retriever: RetrieverYaml
+    kge: KGEYaml = None
     optimizer: OptimizerYaml
     eval: EvalYaml
     train: RetrieverExpYaml
@@ -41,7 +53,11 @@ def load_yaml(config_file):
     task = yaml_data.pop('task')
     assert task == 'retriever'
     
-    config = RetrieverTrainYaml(**yaml_data).model_dump()
+    # Handle optional KGE configuration
+    if 'kge' not in yaml_data:
+        yaml_data['kge'] = None
+    
+    config = RetrieverTrainYaml(**yaml_data).dict()
     config['eval']['k_list'] = [
         int(k) for k in config['eval']['k_list'].split(',')]
 

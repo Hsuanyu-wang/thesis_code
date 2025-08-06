@@ -17,8 +17,8 @@ parameters:
     value: sys_icl_dc_repro
 
   model_name:
-    value: meta-llama/Meta-Llama-3.1-8B-Instruct
-    # value: gpt-4o-mini
+    # value: meta-llama/Meta-Llama-3.1-8B-Instruct
+    value: microsoft/DialoGPT-medium
   dataset_name:
     value: webqsp
   gpu:

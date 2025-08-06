@@ -1,0 +1,28 @@
+# WebQSP experiments with different KGE models
+webqsp no_kge
+webqsp transe
+webqsp distmult
+webqsp rotate
+webqsp complex
+webqsp simple
+webqsp interht
+
+# CWQ experiments
+cwq no_kge
+cwq transe
+cwq distmult
+cwq rotate
+cwq complex
+cwq simple
+cwq interht
+
+# KGQAGen experiments
+kgqagen no_kge
+kgqagen transe
+kgqagen distmult
+kgqagen rotate
+kgqagen complex
+kgqagen simple
+kgqagen interht
+
+ 

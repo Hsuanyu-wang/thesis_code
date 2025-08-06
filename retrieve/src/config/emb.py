@@ -18,4 +18,4 @@ def load_yaml(config_file):
     task = yaml_data.pop('task')
     assert task == 'emb'
     
-    return EmbYaml(**yaml_data).model_dump()
+    return EmbYaml(**yaml_data).dict()

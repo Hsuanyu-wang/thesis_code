@@ -1,23 +1,22 @@
 import os
 import time
-import openai
+# import openai
 from vllm import LLM, SamplingParams
-from openai import OpenAI
+# from openai import OpenAI
 from functools import partial
 from prompts import icl_user_prompt, icl_ass_prompt
 
 
 def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192, max_tokens=4000, seed=0, temperature=0, frequency_penalty=0):
-    if "gpt" not in model_name:
-        client = LLM(model=model_name, tensor_parallel_size=tensor_parallel_size, max_seq_len_to_capture=max_seq_len_to_capture)
-        sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens,
-                                         frequency_penalty=frequency_penalty)
-        llm = partial(client.chat, sampling_params=sampling_params, use_tqdm=False)
-    else:
-        # api_key = input("Enter OpenAI API key: ")
-        # os.environ["OPENAI_API_KEY"] = api_key
-        client = OpenAI()
-        llm = partial(client.chat.completions.create, model=model_name, seed=seed, temperature=temperature, max_tokens=max_tokens)
+    # Only allow local models, block paid APIs
+    if "gpt" in model_name:
+        print("[WARNING] Paid API models (like OpenAI GPT) are disabled on this system. Using a small local model instead.")
+        # Default to a small model that fits in 4090 VRAM
+        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    client = LLM(model=model_name, tensor_parallel_size=tensor_parallel_size, max_seq_len_to_capture=max_seq_len_to_capture)
+    sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens,
+                                     frequency_penalty=frequency_penalty)
+    llm = partial(client.chat, sampling_params=sampling_params, use_tqdm=False)
     return llm
 
 

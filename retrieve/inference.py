@@ -1,16 +1,20 @@
 import os
 import torch
+import numpy as np
 
-from tqdm import tqdm
+# from tqdm import tqdm  # 移除 tqdm
 
 from src.dataset.retriever import RetrieverDataset, collate_retriever
 from src.model.retriever import Retriever
 from src.setup import set_seed, prepare_sample
+from src.model.kge_utils import create_kge_config_from_model
 
+# 推論腳本 (Inference script)
 @torch.no_grad()
 def main(args):
     device = torch.device(f'cuda:0')
     
+    # 1. 載入資料集 (Load dataset)
     cpt = torch.load(args.path, map_location='cpu')
     config = cpt['config']
     set_seed(config['env']['seed'])
@@ -20,13 +24,24 @@ def main(args):
         config=config, split='test', skip_no_path=False)
     
     emb_size = infer_set[0]['q_emb'].shape[-1]
-    model = Retriever(emb_size, **config['retriever']).to(device)
+    # KGE integration: load KGE config if enabled
+    kge_config = None
+    if config.get('kge', {}) and config['kge'].get('enabled', False):
+        dataset_name = config['dataset']['name']
+        model_type = config['kge']['model_type']
+        kge_config = create_kge_config_from_model(dataset_name, model_type, 'train')
+        if kge_config is None:
+            print("Warning: KGE is enabled but no trained model found. Inference will proceed without KGE.")
+        else:
+            print(f"KGE configuration loaded: {kge_config['model_type']} with {kge_config['embedding_dim']} dimensions")
+    # 2. 載入訓練好的模型 (Load trained model)
+    model = Retriever(emb_size, **config['retriever'], kge_config=kge_config).to(device)
     model.load_state_dict(cpt['model_state_dict'])
     model = model.to(device)
     model.eval()
     
     pred_dict = dict()
-    for i in tqdm(range(len(infer_set))):
+    for i in range(len(infer_set)):
         raw_sample = infer_set[i]
         sample = collate_retriever([raw_sample])
         h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs,\
@@ -39,7 +54,8 @@ def main(args):
         target_relevant_triples = []
 
         if len(h_id_tensor) != 0:
-            pred_triple_logits = model(
+            # 3. 執行推論 (Run inference)
+            pred_triple_logits, kge_score = model(
                 h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs,
                 num_non_text_entities, relation_embs, topic_entity_one_hot)
             pred_triple_scores = torch.sigmoid(pred_triple_logits).reshape(-1)
@@ -78,7 +94,15 @@ def main(args):
         pred_dict[raw_sample['id']] = sample_dict
 
     root_path = os.path.dirname(args.path)
-    torch.save(pred_dict, os.path.join(root_path, 'retrieval_result.pth'))
+    # 若路徑包含 webqsp_xxx 這類，則改為 training result/xxx
+    if os.path.basename(os.path.dirname(args.path)).startswith('webqsp') or os.path.basename(os.path.dirname(args.path)).startswith('cwq'):
+        exp_name = os.path.basename(os.path.dirname(args.path))
+        result_root = os.path.join('training result', exp_name)
+    else:
+        result_root = os.path.dirname(args.path)
+    os.makedirs(result_root, exist_ok=True)
+    # 4. 儲存推論結果 (Save inference results)
+    torch.save(pred_dict, os.path.join(result_root, 'retrieval_result.pth'))
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
