@@ -266,9 +266,8 @@ if __name__ == '__main__':
     parser.add_argument('--force_retrain', action='store_true',
                         help='Force retrain even if model exists')
     parser.add_argument('--model_type', type=str, default=None,
-                        choices=['transe', 'distmult', 'ptranse', 'rotate', 'complex', 'simple', 'interht', 'cmkge', 'cake', 'kgeprisma', 'rdf2vec',
-                                'pykeen_transe', 'pykeen_distmult', 'pykeen_complex', 'pykeen_rotate', 'pykeen_simple'],
-                        help='KGE model type (可選: transe, distmult, ptranse, rotate, complex, simple, interht, cmkge, cake, kgeprisma, rdf2vec, pykeen_*)')
+                        choices=['transe', 'distmult', 'ptranse', 'rotate', 'complex', 'simple', 'interht', 'cmkge', 'cake', 'kgeprisma', 'rdf2vec'],
+                        help='KGE model type (可選: transe, distmult, ptranse, rotate, complex, simple, interht, cmkge, cake, kgeprisma, rdf2vec)')
     args = parser.parse_args()
     
     main(args) 
