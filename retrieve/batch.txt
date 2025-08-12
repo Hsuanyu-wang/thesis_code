@@ -1,5 +1,7 @@
-
-webqsp cmkge
-webqsp cake 
-webqsp kgeprisma
-webqsp rdf2vec
+webqsp no_kge 1
+webqsp transe 1
+webqsp distmult 1
+webqsp rotate 1
+webqsp complex 1
+webqsp simple 1
+webqsp interht 1

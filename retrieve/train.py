@@ -3,6 +3,7 @@ import numpy as np
 import os
 import pandas as pd
 import time
+from datetime import datetime, timezone, timedelta
 import torch
 import torch.nn.functional as F
 import wandb
@@ -165,7 +166,10 @@ def main(args):
     set_seed(config['env']['seed'])  # 設定隨機種子
 
     # 設定實驗名稱與 wandb 追蹤
-    ts = time.strftime('%b%d-%H:%M:%S', time.gmtime())
+    # ts = time.strftime('%b%d-%H:%M:%S', time.gmtime())
+    dt = datetime.now(timezone(timedelta(hours=8)))
+    ts = dt.strftime("%Y%m%d_%H%M%S")
+    
     config_df = pd.json_normalize(config, sep='/')
     exp_prefix = config['train']['save_prefix']
     

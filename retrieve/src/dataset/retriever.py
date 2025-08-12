@@ -1,66 +1,91 @@
-# ########################################
-# # Optimal Subgraph Gold 標註法具體實現
-# # 1. 限制長度內所有路徑 (All Paths within a Length Threshold)
-# def all_paths_within_length(nx_g, q_entity_id_list, a_entity_id_list, max_length=3):
-#     """
-#     取得所有主題實體到答案實體間，長度不超過 max_length 的所有路徑
-#     Returns: List[List[entity_id]]
-#     """
-#     path_list_ = []
-#     for q_entity_id in q_entity_id_list:
-#         for a_entity_id in a_entity_id_list:
-#             try:
-#                 # networkx.all_simple_paths 支援 cutoff 參數
-#                 paths = list(nx.all_simple_paths(nx_g, q_entity_id, a_entity_id, cutoff=max_length))
-#                 path_list_.extend(paths)
-#             except:
-#                 continue
-#     return path_list_
+########################################
+# Optimal Subgraph Gold 標註法具體實現
+# 1. 限制長度內所有路徑 (All Paths within a Length Threshold)
+def all_paths_within_length(nx_g, q_entity_id_list, a_entity_id_list, max_length=None, max_paths=None):
+    """
+    取得所有主題實體到答案實體間的路徑
+    Args:
+        nx_g: networkx 圖物件
+        q_entity_id_list: 查詢實體 ID 列表
+        a_entity_id_list: 答案實體 ID 列表
+        max_length: 最大路徑長度，若為 None 則不限制長度
+        max_paths: 最大路徑數量，若為 None 則取所有路徑，若為 'medium' 則取中等數量
+    Returns: List[List[entity_id]]
+    """
+    path_list_ = []
+    for q_entity_id in q_entity_id_list:
+        for a_entity_id in a_entity_id_list:
+            try:
+                # 如果指定了 max_length，使用 cutoff 參數
+                if max_length is not None:
+                    paths = list(nx.all_simple_paths(nx_g, q_entity_id, a_entity_id, cutoff=max_length))
+                else:
+                    # 不限制長度，取得所有路徑
+                    paths = list(nx.all_simple_paths(nx_g, q_entity_id, a_entity_id))
+                path_list_.extend(paths)
+            except:
+                continue
+    
+    # 如果指定了 max_paths，限制路徑數量
+    if max_paths is not None:
+        if max_paths == 'medium':
+            # 取中等數量的路徑
+            total_paths = len(path_list_)
+            if total_paths > 0:
+                # 取中間 50% 的路徑
+                start_idx = total_paths // 4
+                end_idx = 3 * total_paths // 4
+                path_list_ = path_list_[start_idx:end_idx]
+        elif isinstance(max_paths, int):
+            # 取指定數量的路徑
+            path_list_ = path_list_[:max_paths]
+    
+    return path_list_
 
-# # 2. 隨機遊走子圖 (Random Walk-based Subgraph)
-# import random
+# 2. 隨機遊走子圖 (Random Walk-based Subgraph)
+import random
 
-# def random_walk_paths(nx_g, q_entity_id_list, a_entity_id_list, num_walks=20, walk_length=4):
-#     """
-#     以主題實體為起點，進行多次隨機遊走，收集能到達答案的路徑
-#     Returns: List[List[entity_id]]
-#     """
-#     path_list_ = []
-#     for q_entity_id in q_entity_id_list:
-#         for _ in range(num_walks):
-#             path = [q_entity_id]
-#             current = q_entity_id
-#             for _ in range(walk_length):
-#                 neighbors = list(nx_g.successors(current))
-#                 if not neighbors:
-#                     break
-#                 next_node = random.choice(neighbors)
-#                 path.append(next_node)
-#                 current = next_node
-#                 if current in a_entity_id_list:
-#                     path_list_.append(path.copy())
-#                     break
-#     return path_list_
+def random_walk_paths(nx_g, q_entity_id_list, a_entity_id_list, num_walks=20, walk_length=4):
+    """
+    以主題實體為起點，進行多次隨機遊走，收集能到達答案的路徑
+    Returns: List[List[entity_id]]
+    """
+    path_list_ = []
+    for q_entity_id in q_entity_id_list:
+        for _ in range(num_walks):
+            path = [q_entity_id]
+            current = q_entity_id
+            for _ in range(walk_length):
+                neighbors = list(nx_g.successors(current))
+                if not neighbors:
+                    break
+                next_node = random.choice(neighbors)
+                path.append(next_node)
+                current = next_node
+                if current in a_entity_id_list:
+                    path_list_.append(path.copy())
+                    break
+    return path_list_
 
-# # 3. Personalized PageRank 子圖 (Personalized PageRank Subgraph)
-# def pagerank_topk_edges(nx_g, q_entity_id_list, topk=10):
-#     """
-#     以主題實體為 seed，計算 Personalized PageRank，取分數最高的 topk 條邊
-#     Returns: List[Tuple(h_id, t_id)]
-#     """
-#     # 多個主題實體平均分配權重
-#     personalization = {n: 0 for n in nx_g.nodes()}
-#     for q in q_entity_id_list:
-#         personalization[q] = 1  # 將 float 改為 int，避免 linter 錯誤
-#     pr = nx.pagerank(nx_g, personalization=personalization)
-#     # 取分數最高的 topk 節點，然後找出這些節點相關的邊
-#     top_nodes = sorted(pr, key=pr.get, reverse=True)[:topk]
-#     edge_set = set()
-#     for h in top_nodes:
-#         for t in nx_g.successors(h):
-#             edge_set.add((h, t))
-#     return list(edge_set)
-# ########################################
+# 3. Personalized PageRank 子圖 (Personalized PageRank Subgraph)
+def pagerank_topk_edges(nx_g, q_entity_id_list, topk=10):
+    """
+    以主題實體為 seed，計算 Personalized PageRank，取分數最高的 topk 條邊
+    Returns: List[Tuple(h_id, t_id)]
+    """
+    # 多個主題實體平均分配權重
+    personalization = {n: 0 for n in nx_g.nodes()}
+    for q in q_entity_id_list:
+        personalization[q] = 1  # 將 float 改為 int，避免 linter 錯誤
+    pr = nx.pagerank(nx_g, personalization=personalization)
+    # 取分數最高的 topk 節點，然後找出這些節點相關的邊
+    top_nodes = sorted(pr, key=pr.get, reverse=True)[:topk]
+    edge_set = set()
+    for h in top_nodes:
+        for t in nx_g.successors(h):
+            edge_set.add((h, t))
+    return list(edge_set)
+########################################
 import networkx as nx
 import numpy as np
 import os
@@ -155,11 +180,19 @@ class RetrieverDataset:
         path_list_ = []
         for q_entity_id in sample['q_entity_id_list']:
             for a_entity_id in sample['a_entity_id_list']:
-                paths_q_a = self._shortest_path(nx_g, q_entity_id, a_entity_id)
+                # paths_q_a = self._shortest_path(nx_g, q_entity_id, a_entity_id)
                 ##############################################################
-                # paths_q_a = pagerank_topk_edges(nx_g, q_entity_id, topk=10)
+                paths_q_a = pagerank_topk_edges(nx_g, q_entity_id, topk=10)
                 # paths_q_a = random_walk_paths(nx_g, q_entity_id, a_entity_id)
+                # 可以選擇以下幾種方式：
+                # 1. 指定最大長度
                 # paths_q_a = all_paths_within_length(nx_g, q_entity_id, a_entity_id, max_length=3)
+                # 2. 不限制長度，取所有路徑
+                # paths_q_a = all_paths_within_length(nx_g, q_entity_id, a_entity_id)
+                # 3. 不限制長度，取中等數量的路徑
+                # paths_q_a = all_paths_within_length(nx_g, q_entity_id, a_entity_id, max_paths='medium')
+                # 4. 不限制長度，取指定數量的路徑
+                # paths_q_a = all_paths_within_length(nx_g, q_entity_id, a_entity_id, max_paths=10)
                 ##############################################################
                 if len(paths_q_a) > 0:
                     path_list_.extend(paths_q_a)

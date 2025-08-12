@@ -413,37 +413,31 @@ run_batch_tasks() {
     local completed_tasks=0
     local failed_tasks=0
     
-    # Count total tasks
+    # First pass: count total tasks and store valid lines
+    local valid_lines=()
     while IFS= read -r line; do
         line_num=$((line_num + 1))
         # Skip empty lines and comments
         if [[ -n "$line" && ! "$line" =~ ^[[:space:]]*# ]]; then
             total_tasks=$((total_tasks + 1))
+            valid_lines+=("$line")
         fi
     done < "$config_file"
     
     print_status "Found $total_tasks tasks to process"
     echo ""
     
-    # Process each task
-    line_num=0
-    while IFS= read -r line; do
-        line_num=$((line_num + 1))
+    # Second pass: process each valid task
+    for line in "${valid_lines[@]}"; do
+        # Parse task configuration (same format as single task: dataset kge_model max_epochs experiment_id)
+        read -r dataset kge_model max_epochs experiment_id <<< "$line"
         
-        # Skip empty lines and comments
-        if [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]; then
-            continue
-        fi
-        
-        # Parse task configuration
-        read -r dataset max_epochs kge_model experiment_id <<< "$line"
-        
-        # Set defaults if not provided
-        max_epochs=${max_epochs:-10000}
+        # Set defaults if not provided (following single task logic)
         kge_model=${kge_model:-"no_kge"}
-        experiment_id=${experiment_id:-""} # Ensure experiment_id is not empty
+        max_epochs=${max_epochs:-10000}
+        experiment_id=${experiment_id:-""} # Will be auto-generated if empty
         
-        # Convert empty or "no_kge" to empty string for internal use
+        # Convert empty or "no_kge" to empty string for internal use (same as single task)
         if [ "$kge_model" = "no_kge" ] || [ -z "$kge_model" ]; then
             kge_model=""
         fi
@@ -469,8 +463,7 @@ run_batch_tasks() {
         print_status "Progress: $((completed_tasks + failed_tasks))/$total_tasks completed"
         print_status "Success: $completed_tasks, Failed: $failed_tasks"
         echo ""
-        
-    done < "$config_file"
+    done
     
     # Final summary
     echo "========================================"
@@ -519,14 +512,16 @@ show_help() {
     echo "    Terminal 3: $0 cwq rotate 5000 exp003"
     echo ""
     echo "Batch Config File Format:"
-    echo "  # Each line: dataset max_epochs kge_model experiment_id"
-    echo "  # Use 'no_kge' to disable KGE model"
+    echo "  # Each line: dataset kge_model max_epochs experiment_id (same as single task)"
+    echo "  # Use 'no_kge' or leave empty to disable KGE model"
     echo "  # Leave experiment_id empty for auto-generation"
-    echo "  webqsp 10000 transe exp001"
-    echo "  webqsp 10000 distmult exp002"
-    echo "  cwq 5000 rotate exp003"
-    echo "  kgqagen 10000 interht exp004"
-    echo "  webqsp 10000 no_kge exp005"
+    echo "  webqsp transe 10000 exp001"
+    echo "  webqsp distmult 10000 exp002"
+    echo "  cwq rotate 5000 exp003"
+    echo "  kgqagen interht 10000 exp004"
+    echo "  webqsp no_kge 10000 exp005"
+    echo "  webqsp transe 5000"
+    echo "  cwq"
     echo ""
     echo "Steps:"
     echo "  1. Pre-compute embeddings"

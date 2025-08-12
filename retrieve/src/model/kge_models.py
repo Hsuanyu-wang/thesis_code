@@ -3,6 +3,87 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+def create_kge_model(model_type, num_entities, num_relations, embedding_dim, **kwargs):
+    """
+    KGE模型工廠函數 (Factory function to create KGE models)
+    根據model_type建立對應的KGE模型
+    Supported: transe, distmult, ptranse, rotate, complex, simple, interht
+    """
+    model_type_lower = model_type.lower()
+    
+    if model_type_lower == 'transe':
+        # TransE supports margin and norm
+        margin = kwargs.get('margin', 1.0)
+        norm = kwargs.get('norm', 1)
+        return TransE(num_entities, num_relations, embedding_dim, margin=margin, norm=norm)
+    
+    elif model_type_lower == 'distmult':
+        # DistMult only supports basic parameters
+        return DistMult(num_entities, num_relations, embedding_dim)
+    
+    elif model_type_lower == 'ptranse':
+        # PTransE supports margin and norm
+        margin = kwargs.get('margin', 1.0)
+        norm = kwargs.get('norm', 1)
+        return PTransE(num_entities, num_relations, embedding_dim, margin=margin, norm=norm)
+    
+    elif model_type_lower == 'rotate':
+        # RotatE only supports margin
+        margin = kwargs.get('margin', 6.0)
+        return RotatE(num_entities, num_relations, embedding_dim, margin=margin)
+    
+    elif model_type_lower == 'complex':
+        # ComplEx only supports basic parameters
+        return ComplEx(num_entities, num_relations, embedding_dim)
+    
+    elif model_type_lower == 'simple':
+        # SimplE only supports basic parameters
+        return SimplE(num_entities, num_relations, embedding_dim)
+    
+    elif model_type_lower == 'interht':
+        # InterHT supports margin and u
+        margin = kwargs.get('margin', 1.0)
+        u = kwargs.get('u', 1.0)
+        return InterHT(num_entities, num_relations, embedding_dim, margin=margin, u=u)
+    
+    ####################################
+    elif model_type_lower == 'cmkge':
+        margin = kwargs.get('margin', 1.0)
+        norm = kwargs.get('norm', 1)
+        return CMKGE(num_entities, num_relations, embedding_dim, margin=margin, norm=norm)
+
+    elif model_type_lower == 'cake':
+        commonsense_dim = kwargs.get('commonsense_dim', 100)
+        return CAKE(num_entities, num_relations, embedding_dim, commonsense_dim=commonsense_dim)
+
+    elif model_type_lower == 'kgeprisma':
+        margin = kwargs.get('margin', 1.0)
+        return KGEPrisma(num_entities, num_relations, embedding_dim, margin=margin)
+
+    elif model_type_lower == 'rdf2vec':
+        # walk_sequences 應以關鍵字參數傳入
+        walk_sequences = kwargs['walk_sequences']  # 必須提供
+        return RDF2Vec(num_entities, embedding_dim, walk_sequences=walk_sequences)
+    ####################################
+    else:
+        raise ValueError(f"Unknown KGE model type: {model_type}") 
+    
+
+class KGELoss(nn.Module):
+    """
+    Loss function for KGE models
+    """
+    def __init__(self, margin=1.0):
+        super(KGELoss, self).__init__()
+        self.margin = margin
+    
+    def forward(self, pos_score, neg_score):
+        """
+        Compute margin ranking loss
+        """
+        loss = torch.clamp(pos_score - neg_score + self.margin, min=0)
+        return loss.mean()
+    
 class TransE(nn.Module):
     """
     TransE: Translating Embeddings for Modeling Multi-relational Data
@@ -178,21 +259,6 @@ class PTransE(nn.Module):
         Get entity and relation embeddings
         """
         return self.entity_embeddings.weight.data, self.relation_embeddings.weight.data
-
-class KGELoss(nn.Module):
-    """
-    Loss function for KGE models
-    """
-    def __init__(self, margin=1.0):
-        super(KGELoss, self).__init__()
-        self.margin = margin
-    
-    def forward(self, pos_score, neg_score):
-        """
-        Compute margin ranking loss
-        """
-        loss = torch.clamp(pos_score - neg_score + self.margin, min=0)
-        return loss.mean()
 
 class RotatE(nn.Module):
     """
@@ -422,71 +488,7 @@ class InterHT(nn.Module):
     def get_embeddings(self):
         return self.entity_embeddings.weight.data, self.relation_embeddings.weight.data
 
-def create_kge_model(model_type, num_entities, num_relations, embedding_dim, **kwargs):
-    """
-    KGE模型工廠函數 (Factory function to create KGE models)
-    根據model_type建立對應的KGE模型
-    Supported: transe, distmult, ptranse, rotate, complex, simple, interht
-    """
-    model_type_lower = model_type.lower()
-    
-    if model_type_lower == 'transe':
-        # TransE supports margin and norm
-        margin = kwargs.get('margin', 1.0)
-        norm = kwargs.get('norm', 1)
-        return TransE(num_entities, num_relations, embedding_dim, margin=margin, norm=norm)
-    
-    elif model_type_lower == 'distmult':
-        # DistMult only supports basic parameters
-        return DistMult(num_entities, num_relations, embedding_dim)
-    
-    elif model_type_lower == 'ptranse':
-        # PTransE supports margin and norm
-        margin = kwargs.get('margin', 1.0)
-        norm = kwargs.get('norm', 1)
-        return PTransE(num_entities, num_relations, embedding_dim, margin=margin, norm=norm)
-    
-    elif model_type_lower == 'rotate':
-        # RotatE only supports margin
-        margin = kwargs.get('margin', 6.0)
-        return RotatE(num_entities, num_relations, embedding_dim, margin=margin)
-    
-    elif model_type_lower == 'complex':
-        # ComplEx only supports basic parameters
-        return ComplEx(num_entities, num_relations, embedding_dim)
-    
-    elif model_type_lower == 'simple':
-        # SimplE only supports basic parameters
-        return SimplE(num_entities, num_relations, embedding_dim)
-    
-    elif model_type_lower == 'interht':
-        # InterHT supports margin and u
-        margin = kwargs.get('margin', 1.0)
-        u = kwargs.get('u', 1.0)
-        return InterHT(num_entities, num_relations, embedding_dim, margin=margin, u=u)
-    
-    ####################################
-    elif model_type_lower == 'cmkge':
-        margin = kwargs.get('margin', 1.0)
-        norm = kwargs.get('norm', 1)
-        return CMKGE(num_entities, num_relations, embedding_dim, margin=margin, norm=norm)
 
-    elif model_type_lower == 'cake':
-        commonsense_dim = kwargs.get('commonsense_dim', 100)
-        return CAKE(num_entities, num_relations, embedding_dim, commonsense_dim=commonsense_dim)
-
-    elif model_type_lower == 'kgeprisma':
-        margin = kwargs.get('margin', 1.0)
-        return KGEPrisma(num_entities, num_relations, embedding_dim, margin=margin)
-
-    elif model_type_lower == 'rdf2vec':
-        # walk_sequences 應以關鍵字參數傳入
-        walk_sequences = kwargs['walk_sequences']  # 必須提供
-        return RDF2Vec(num_entities, embedding_dim, walk_sequences=walk_sequences)
-    ####################################
-    else:
-        raise ValueError(f"Unknown KGE model type: {model_type}") 
-    
 ###########################
 
 class CMKGE(nn.Module):
@@ -545,7 +547,6 @@ class CMKGE(nn.Module):
 
     def get_embeddings(self):
         return self.entity_embeddings.weight.data, self.relation_embeddings.weight.data
-
 
 class CAKE(nn.Module):
     """
@@ -606,7 +607,6 @@ class CAKE(nn.Module):
     def get_embeddings(self):
         return self.entity_embeddings.weight.data, self.commonsense_embeddings.weight.data, self.relation_embeddings.weight.data
 
-
 class KGEPrisma(nn.Module):
     """
     KGEPrisma: 可解釋知識圖嵌入
@@ -655,7 +655,6 @@ class KGEPrisma(nn.Module):
 
     def get_embeddings(self):
         return self.entity_embeddings.weight.data, self.relation_embeddings.weight.data
-
 
 class RDF2Vec(nn.Module):
     """

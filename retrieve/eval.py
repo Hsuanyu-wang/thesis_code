@@ -4,7 +4,7 @@ import torch
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # 檢索評估腳本 (Evaluation script)
 def main(args):
@@ -88,7 +88,9 @@ def save_results(args, metric_dict, table_dict, df):
     os.makedirs(result_dir, exist_ok=True)
     
     # 產生時間戳記
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dt = datetime.now(timezone(timedelta(hours=8)))
+    timestamp = dt.strftime("%Y%m%d_%H%M%S")
     
     # 從路徑中提取實驗名稱
     exp_name = os.path.basename(os.path.dirname(args.path))
@@ -99,7 +101,9 @@ def save_results(args, metric_dict, table_dict, df):
     base_filename = f"{args.dataset}_{exp_name}_{timestamp}"
     
     # 1. 儲存 CSV 表格，包含 use_kge 與 subgraph_method 欄位
-    csv_path = os.path.join(result_dir, f"{args.dataset}", f"{base_filename}.csv")
+    dataset_dir = os.path.join(result_dir, f"{args.dataset}")
+    os.makedirs(dataset_dir, exist_ok=True)
+    csv_path = os.path.join(dataset_dir, f"{base_filename}.csv")
     df.to_csv(csv_path, index=False)
     print(f"CSV 結果已儲存至: {csv_path}")
     
@@ -121,28 +125,22 @@ def save_results(args, metric_dict, table_dict, df):
         json.dump(json_result, f, indent=2, ensure_ascii=False)
     print(f"JSON 詳細結果已儲存至: {json_path}")
     
-    # 3. 儲存簡化的摘要檔案，包含所有 K 的 recall 以及 use_kge_method 與 subgraph_method
+    # 3. 儲存簡化的摘要檔案，動態根據 k_list 生成所有 K 的 recall
+    k_list = [int(k) for k in args.k_list.split(',')]
+    key_metrics = {}
+    
+    for k in k_list:
+        key_metrics[f"ans_recall@{k}"] = round(metric_dict.get(f'ans_recall@{k}', 0), 3)
+        key_metrics[f"shortest_path_triple_recall@{k}"] = round(metric_dict.get(f'shortest_path_triple_recall@{k}', 0), 3)
+        key_metrics[f"gpt_triple_recall@{k}"] = round(metric_dict.get(f'gpt_triple_recall@{k}', 0), 3)
+    
     summary = {
         "dataset": args.dataset,
         "experiment": exp_name,
         "timestamp": timestamp,
         "use_kge": args.use_kge,  # 紀錄 KGE 方法或 False
         "subgraph_method": args.subgraph_method,  # 新增 subgraph_method
-        "key_metrics": {
-            # 三種 recall 各自記錄 @50, @100, @200, @400
-            "ans_recall@50": round(metric_dict.get('ans_recall@50', 0), 3),
-            "ans_recall@100": round(metric_dict.get('ans_recall@100', 0), 3),
-            "ans_recall@200": round(metric_dict.get('ans_recall@200', 0), 3),
-            "ans_recall@400": round(metric_dict.get('ans_recall@400', 0), 3),
-            "shortest_path_triple_recall@50": round(metric_dict.get('shortest_path_triple_recall@50', 0), 3),
-            "shortest_path_triple_recall@100": round(metric_dict.get('shortest_path_triple_recall@100', 0), 3),
-            "shortest_path_triple_recall@200": round(metric_dict.get('shortest_path_triple_recall@200', 0), 3),
-            "shortest_path_triple_recall@400": round(metric_dict.get('shortest_path_triple_recall@400', 0), 3),
-            "gpt_triple_recall@50": round(metric_dict.get('gpt_triple_recall@50', 0), 3),
-            "gpt_triple_recall@100": round(metric_dict.get('gpt_triple_recall@100', 0), 3),
-            "gpt_triple_recall@200": round(metric_dict.get('gpt_triple_recall@200', 0), 3),
-            "gpt_triple_recall@400": round(metric_dict.get('gpt_triple_recall@400', 0), 3)
-        }
+        "key_metrics": key_metrics
     }
     
     summary_path = os.path.join(result_dir, f"{base_filename}_summary.json")
@@ -151,61 +149,65 @@ def save_results(args, metric_dict, table_dict, df):
     print(f"摘要結果已儲存至: {summary_path}")
     
     # 4. 更新或建立比較表格，傳遞 use_kge 與 subgraph_method
-    update_comparison_table(result_dir, args.dataset, summary)
+    update_comparison_table(result_dir, args.dataset, summary, k_list)
 
-def update_comparison_table(result_dir, dataset, summary):
+def update_comparison_table(result_dir, dataset, summary, k_list):
     """
     更新或建立實驗比較表格，並將 use_kge 與 subgraph_method 一併寫入
+    所有比較表格都使用 append 模式，不覆蓋舊紀錄
     """
     comparison_file = os.path.join(result_dir, f'{dataset}', f"{dataset}_comparison.csv")
     
-    # 準備要新增的資料行，包含所有 K 的 recall 以及 use_kge_method 與 subgraph_method
+    # 準備要新增的資料行，動態根據 k_list 生成所有 K 的 recall
     new_row = {
         "experiment": summary["experiment"],
         "timestamp": summary["timestamp"],
         "use_kge": summary["use_kge"],  # 紀錄 KGE 方法或 False
         "subgraph_method": summary["subgraph_method"],  # 新增 subgraph_method
-        "ans_recall@50": summary["key_metrics"]["ans_recall@50"],
-        "ans_recall@100": summary["key_metrics"]["ans_recall@100"],
-        "ans_recall@200": summary["key_metrics"]["ans_recall@200"],
-        "ans_recall@400": summary["key_metrics"]["ans_recall@400"],
-        "shortest_path_triple_recall@50": summary["key_metrics"]["shortest_path_triple_recall@50"],
-        "shortest_path_triple_recall@100": summary["key_metrics"]["shortest_path_triple_recall@100"],
-        "shortest_path_triple_recall@200": summary["key_metrics"]["shortest_path_triple_recall@200"],
-        "shortest_path_triple_recall@400": summary["key_metrics"]["shortest_path_triple_recall@400"],
-        "gpt_triple_recall@50": summary["key_metrics"]["gpt_triple_recall@50"],
-        "gpt_triple_recall@100": summary["key_metrics"]["gpt_triple_recall@100"],
-        "gpt_triple_recall@200": summary["key_metrics"]["gpt_triple_recall@200"],
-        "gpt_triple_recall@400": summary["key_metrics"]["gpt_triple_recall@400"],
     }
     
-    # 如果比較檔案存在，讀取並更新
+    # 動態添加所有 k 值的 recall 指標
+    for k in k_list:
+        new_row[f"ans_recall@{k}"] = summary["key_metrics"][f"ans_recall@{k}"]
+        new_row[f"shortest_path_triple_recall@{k}"] = summary["key_metrics"][f"shortest_path_triple_recall@{k}"]
+        new_row[f"gpt_triple_recall@{k}"] = summary["key_metrics"][f"gpt_triple_recall@{k}"]
+    
+    # 如果比較檔案存在，使用 append 模式
     if os.path.exists(comparison_file):
         comparison_df = pd.read_csv(comparison_file)
-        # 檢查是否已存在相同實驗名稱的記錄
-        if summary["experiment"] in comparison_df["experiment"].values:
-            # 更新現有記錄
-            comparison_df.loc[comparison_df["experiment"] == summary["experiment"], 
-                ["timestamp", "use_kge", "subgraph_method",
-                 "ans_recall@50", "ans_recall@100", "ans_recall@200", "ans_recall@400",
-                 "shortest_path_triple_recall@50", "shortest_path_triple_recall@100", "shortest_path_triple_recall@200", "shortest_path_triple_recall@400",
-                 "gpt_triple_recall@50", "gpt_triple_recall@100", "gpt_triple_recall@200", "gpt_triple_recall@400"
-                ]] = [
-                summary["timestamp"], summary["use_kge"], summary["subgraph_method"],
-                summary["key_metrics"]["ans_recall@50"], summary["key_metrics"]["ans_recall@100"], summary["key_metrics"]["ans_recall@200"], summary["key_metrics"]["ans_recall@400"],
-                summary["key_metrics"]["shortest_path_triple_recall@50"], summary["key_metrics"]["shortest_path_triple_recall@100"], summary["key_metrics"]["shortest_path_triple_recall@200"], summary["key_metrics"]["shortest_path_triple_recall@400"],
-                summary["key_metrics"]["gpt_triple_recall@50"], summary["key_metrics"]["gpt_triple_recall@100"], summary["key_metrics"]["gpt_triple_recall@200"], summary["key_metrics"]["gpt_triple_recall@400"]
-            ]
-        else:
-            # 新增新記錄
+        
+        # 檢查新資料的列是否與現有表格的列相同
+        new_columns = set(new_row.keys())
+        existing_columns = set(comparison_df.columns)
+        
+        if new_columns == existing_columns:
+            # 列相同，直接 append 新記錄
             comparison_df = pd.concat([comparison_df, pd.DataFrame([new_row])], ignore_index=True)
+        else:
+            # 列不同，合併欄位並 append
+            # 找出所有欄位的聯集
+            all_columns = list(existing_columns.union(new_columns))
+            
+            # 為現有資料添加缺失的欄位（設為 NaN）
+            for col in new_columns - existing_columns:
+                comparison_df[col] = np.nan
+            
+            # 為新資料添加缺失的欄位（設為 NaN）
+            for col in existing_columns - new_columns:
+                new_row[col] = np.nan
+            
+            # 確保欄位順序一致
+            new_row_ordered = {col: new_row.get(col, np.nan) for col in all_columns}
+            comparison_df = pd.concat([comparison_df, pd.DataFrame([new_row_ordered])], ignore_index=True)
+            
+        print(f"比較表格已更新 (append 模式): {comparison_file}")
     else:
         # 建立新的比較表格
         comparison_df = pd.DataFrame([new_row])
+        print(f"新的比較表格已建立: {comparison_file}")
     
     # 儲存比較表格
     comparison_df.to_csv(comparison_file, index=False)
-    print(f"比較表格已更新: {comparison_file}")
     
     # 顯示最新的比較結果
     print("\n=== 實驗比較表格 ===")
