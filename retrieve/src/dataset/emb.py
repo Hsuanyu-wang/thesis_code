@@ -1,5 +1,6 @@
 import os
 import pickle
+import torch
 
 from tqdm import tqdm
 
@@ -10,7 +11,9 @@ class EmbInferDataset:
         entity_identifiers,
         save_path,
         skip_no_topic=True,
-        skip_no_ans=True
+        skip_no_ans=True,
+        load_embeddings=False,
+        embedding_dir=None
     ):
         """
         Parameters
@@ -22,6 +25,10 @@ class EmbInferDataset:
             Whether to skip samples without topic entities in the graph.
         skip_no_ans : bool
             Whether to skip samples without answer entities in the graph.
+        load_embeddings : bool
+            Whether to load pre-computed embeddings.
+        embedding_dir : str
+            Directory containing pre-computed embeddings.
         """
         self.processed_dict_list = self._process(
             raw_set,
@@ -30,6 +37,8 @@ class EmbInferDataset:
         
         self.skip_no_topic = skip_no_topic
         self.skip_no_ans = skip_no_ans
+        self.load_embeddings = load_embeddings
+        self.embedding_dir = embedding_dir
         
         processed_dict_list = []
         for processed_dict_i in self.processed_dict_list:
@@ -43,6 +52,56 @@ class EmbInferDataset:
         self.processed_dict_list = processed_dict_list
         
         print(f'# raw samples: {len(raw_set)} | # processed samples: {len(self.processed_dict_list)}')
+        
+        # 如果啟用 embedding 載入，預載入所有 embedding 文件
+        if self.load_embeddings and self.embedding_dir:
+            self.embedding_files = self._load_embedding_files()
+            print(f'Loaded {len(self.embedding_files)} embedding files')
+
+    def _load_embedding_files(self):
+        """載入所有 embedding 文件的路徑"""
+        embedding_files = {}
+        if os.path.exists(self.embedding_dir):
+            for filename in os.listdir(self.embedding_dir):
+                if filename.startswith('train_batch_') and filename.endswith('.pth'):
+                    batch_idx = int(filename.split('_')[-1].split('.')[0])
+                    embedding_files[batch_idx] = os.path.join(self.embedding_dir, filename)
+        return embedding_files
+
+    def _load_sample_embeddings(self, sample_id):
+        """載入特定樣本的 embeddings"""
+        if not self.load_embeddings or not self.embedding_dir:
+            return None, None, None
+        
+        # 計算樣本屬於哪個批次
+        batch_idx = sample_id // 64  # 假設批次大小為64
+        
+        if batch_idx not in self.embedding_files:
+            print(f"Warning: Embedding file for batch {batch_idx} not found")
+            return None, None, None
+        
+        try:
+            # 載入批次文件
+            batch_data = torch.load(self.embedding_files[batch_idx])
+            
+            # 獲取樣本在批次中的位置
+            sample_in_batch = sample_id % 64
+            
+            # 找到對應的樣本ID
+            sample_ids = list(batch_data.keys())
+            if sample_in_batch < len(sample_ids):
+                sample_key = sample_ids[sample_in_batch]
+                sample_embeddings = batch_data[sample_key]
+                
+                return (sample_embeddings['q_emb'], 
+                       sample_embeddings['entity_embs'], 
+                       sample_embeddings['relation_embs'])
+            else:
+                return None, None, None
+                
+        except Exception as e:
+            print(f"Error loading embeddings for sample {sample_id}: {e}")
+            return None, None, None
 
     def _process(
         self,
@@ -170,4 +229,22 @@ class EmbInferDataset:
         text_entity_list = sample['text_entity_list']
         relation_list = sample['relation_list']
         
+        # 如果啟用 embedding 載入，返回預計算的 embeddings
+        if self.load_embeddings:
+            q_emb, entity_embs, relation_embs = self._load_sample_embeddings(i)
+            if q_emb is not None:
+                return {
+                    'id': id,
+                    'q_emb': q_emb,
+                    'entity_embs': entity_embs,
+                    'relation_embs': relation_embs,
+                    'h_id_list': sample['h_id_list'],
+                    'r_id_list': sample['r_id_list'],
+                    't_id_list': sample['t_id_list'],
+                    'q_entity_id_list': sample['q_entity_id_list'],
+                    'a_entity_id_list': sample['a_entity_id_list'],
+                    'non_text_entity_list': sample['non_text_entity_list']
+                }
+        
+        # 否則返回原始格式（用於 embedding 生成）
         return id, q_text, text_entity_list, relation_list

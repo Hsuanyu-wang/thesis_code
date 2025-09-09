@@ -1,0 +1,217 @@
+{
+    "os": "Linux-6.8.0-65-generic-x86_64-with-glibc2.35",
+    "python": "3.10.6",
+    "heartbeatAt": "2025-09-02T11:36:48.219261",
+    "startedAt": "2025-09-02T11:36:47.481439",
+    "docker": null,
+    "cuda": null,
+    "args": [
+        "--model",
+        "transe_f_n",
+        "--epochs",
+        "200",
+        "--log_dir",
+        "/home/SubgraphRAG/kge/logs",
+        "--eval_every",
+        "10"
+    ],
+    "state": "running",
+    "program": "/home/SubgraphRAG/kge/kge_train.py",
+    "codePathLocal": "kge_train.py",
+    "codePath": "kge/kge_train.py",
+    "git": {
+        "remote": "https://github.com/Graph-COM/SubgraphRAG.git",
+        "commit": "48eb05e56d11293fa780849512310462c45b956b"
+    },
+    "email": "312666@gmail.com",
+    "root": "/home/SubgraphRAG",
+    "host": "f485c4097f59",
+    "username": "root",
+    "executable": "/usr/bin/python",
+    "cpu_count": 24,
+    "cpu_count_logical": 32,
+    "cpu_freq": {
+        "current": 3390.6863437499997,
+        "min": 800.0,
+        "max": 4937.5
+    },
+    "cpu_freq_per_core": [
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5800.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5800.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5800.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5800.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 5100.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 5500.0
+        },
+        {
+            "current": 4005.776,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4099.984,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4137.727,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4100.01,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4099.937,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4101.595,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4099.993,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4100.093,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4200.078,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 3991.346,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 800.0,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4016.86,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4110.095,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4102.232,
+            "min": 800.0,
+            "max": 4300.0
+        },
+        {
+            "current": 4091.5,
+            "min": 800.0,
+            "max": 4300.0
+        }
+    ],
+    "disk": {
+        "/": {
+            "total": 1861.1993026733398,
+            "used": 1189.0706062316895
+        }
+    },
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 1,
+    "gpu_devices": [
+        {
+            "name": "NVIDIA GeForce RTX 4090",
+            "memory_total": 25757220864
+        }
+    ],
+    "memory": {
+        "total": 62.53830337524414
+    }
+}

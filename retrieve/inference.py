@@ -1,5 +1,6 @@
 import os
 import torch
+import time
 
 from tqdm import tqdm
 
@@ -8,10 +9,10 @@ from src.model.retriever import Retriever
 from src.setup import set_seed, prepare_sample
 
 @torch.no_grad()
-def main(args):
+def _run_inference(path: str, max_K: int = 500):
     device = torch.device(f'cuda:0')
     
-    cpt = torch.load(args.path, map_location='cpu')
+    cpt = torch.load(path, map_location='cpu')
     config = cpt['config']
     set_seed(config['env']['seed'])
     torch.set_num_threads(config['env']['num_threads'])
@@ -39,12 +40,13 @@ def main(args):
         target_relevant_triples = []
 
         if len(h_id_tensor) != 0:
-            pred_triple_logits = model(
+            pred_triple_logits = model((
                 h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs,
-                num_non_text_entities, relation_embs, topic_entity_one_hot)
+                num_non_text_entities, relation_embs, topic_entity_one_hot
+            ))
             pred_triple_scores = torch.sigmoid(pred_triple_logits).reshape(-1)
             top_K_results = torch.topk(pred_triple_scores, 
-                                       min(args.max_K, len(pred_triple_scores)))
+                                       min(max_K, len(pred_triple_scores)))
             top_K_scores = top_K_results.values.cpu().tolist()
             top_K_triple_IDs = top_K_results.indices.cpu().tolist()
 
@@ -77,17 +79,73 @@ def main(args):
         
         pred_dict[raw_sample['id']] = sample_dict
 
-    root_path = os.path.dirname(args.path)
+    root_path = os.path.dirname(path)
     torch.save(pred_dict, os.path.join(root_path, 'retrieval_result.pth'))
+
+@torch.no_grad()
+def main(args):
+    # Batch mode: iterate over subfolders and run inference per checkpoint
+    if args.batch_dir is not None:
+        root = args.batch_dir
+        if not os.path.isdir(root):
+            print(f"Batch directory not found: {root}")
+            return
+        subfolders = sorted([os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+        succeeded = []
+        skipped = []
+        failed = []
+        for folder in subfolders:
+            cpt_path = os.path.join(folder, 'cpt.pth')
+            out_path = os.path.join(folder, 'retrieval_result.pth')
+            if not os.path.exists(cpt_path):
+                failed.append((folder, 'missing cpt.pth'))
+                continue
+            if os.path.exists(out_path) and not args.overwrite:
+                skipped.append(folder)
+                continue
+            try:
+                _run_inference(cpt_path, args.max_K)
+                succeeded.append(folder)
+            except Exception as e:
+                failed.append((folder, str(e)))
+                continue
+        print("=== Batch inference summary ===")
+        print(f"Root: {root}")
+        print(f"Succeeded: {len(succeeded)}")
+        print(f"Skipped (exists): {len(skipped)}")
+        print(f"Failed: {len(failed)}")
+        if failed:
+            print("Failures:")
+            for f, reason in failed:
+                print(f"  - {f}: {reason}")
+        return
+
+    # Single-file mode (original behavior)
+    if args.path is None:
+        raise ValueError('Please provide -p/--path or --batch_dir')
+    _run_inference(args.path, args.max_K)
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
     
     parser = ArgumentParser()
-    parser.add_argument('-p', '--path', type=str, required=True,
+    parser.add_argument('-p', '--path', type=str, required=False,
                         help='Path to a saved model checkpoint, e.g., webqsp_Nov08-01:14:47/cpt.pth')
     parser.add_argument('--max_K', type=int, default=500,
                         help='K in top-K triple retrieval')
+    parser.add_argument('--batch_dir', type=str, default=None,
+                        help='Run inference for all experiment folders under this directory (expects cpt.pth in each).')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Overwrite existing retrieval_result.pth if present in a folder during batch mode.')
     args = parser.parse_args()
     
+    ts_start = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + 8 * 3600))
+    start_time = time.time()
+    print(f"========== Start inference retriever {ts_start} ==========")
+    
     main(args)
+    
+    ts_end = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + 8 * 3600))
+    end_time = time.time()
+    print(f"========== End inference retriever {ts_end} ==========")
+    print(f"Retriever inference time: {end_time - start_time:.2f} seconds")
