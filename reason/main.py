@@ -57,57 +57,89 @@ def load_checkpoint(file_path):
     return []
 
 # 評估所有預測結果，並將指標記錄到 wandb，且追加到 CSV
-def eval_all(pred_file_path, run, subset, split=None, eval_hops=-1, experiment_name=None, csv_path=None):
+def eval_all(pred_file_path, run, subset, split=None, eval_hops=-1, experiment_name=None, csv_path=None, reverse_order=False):
     print("=" * 50)
     print("=" * 50)
     print(f"Evaluating on subset: {subset}")
 
     print("Results:")
     # 使用修正版的評估指標
-    hit1, f1, prec, recall, em, tw, mi_f1, mi_prec, mi_recall, total_cnt, no_ans_cnt, no_ans_ratio, hal_score, stats = eval_results_corrected(str(pred_file_path), cal_f1=True, subset=subset, split=split, eval_hops=eval_hops)
+    # Note: pass split=None to evaluator so predictions are parsed by 'ans:' lines, not dataset split name
+    hit1, f1, prec, recall, em, tw, mi_f1, mi_prec, mi_recall, total_cnt, no_ans_cnt, no_ans_ratio, hal_score, stats = eval_results_corrected(str(pred_file_path), cal_f1=True, subset=subset, split=None, eval_hops=eval_hops, reverse_order=reverse_order)
     if subset:
         postfix = "_sub"
     else:
         postfix = ""
-    # 將各種評估指標記錄到 wandb
-    run.log({f"results{postfix}/hit@1": hit1,
-             f"results{postfix}/macro_f1": f1,
-             f"results{postfix}/macro_precision": prec,
-             f"results{postfix}/macro_recall": recall,
-             f"results{postfix}/exact_match": em,
-             f"results{postfix}/totally_wrong": tw,
-             f"results{postfix}/micro_f1": mi_f1,
-             f"results{postfix}/micro_precision": mi_prec,
-             f"results{postfix}/micro_recall": mi_recall,
-             f"results{postfix}/total_cnt": total_cnt,
-             f"results{postfix}/no_ans_cnt": no_ans_cnt,
-             f"results{postfix}/no_ans_ratio": no_ans_ratio,
-             f"results{postfix}/hal_score": hal_score})  # score_h in the paper
-    if stats is not None:
-        for k, v in stats.items():
-            run.log({f"stats{postfix}/{k}": v})
+    # 將各種評估指標記錄到 wandb（若有提供 run）
+    if run is not None:
+        run.log({f"results{postfix}/hit@1": hit1,
+                 f"results{postfix}/macro_f1": f1,
+                 f"results{postfix}/macro_precision": prec,
+                 f"results{postfix}/macro_recall": recall,
+                 f"results{postfix}/exact_match": em,
+                 f"results{postfix}/totally_wrong": tw,
+                 f"results{postfix}/micro_f1": mi_f1,
+                 f"results{postfix}/micro_precision": mi_prec,
+                 f"results{postfix}/micro_recall": mi_recall,
+                 f"results{postfix}/total_cnt": total_cnt,
+                 f"results{postfix}/no_ans_cnt": no_ans_cnt,
+                 f"results{postfix}/no_ans_ratio": no_ans_ratio,
+                 f"results{postfix}/hal_score": hal_score})  # score_h in the paper
+        if stats is not None:
+            for k, v in stats.items():
+                run.log({f"stats{postfix}/{k}": v})
 
     # 使用原始版的 hit 指標
     hit, _, _, _ = eval_results_original(str(pred_file_path), cal_f1=True, subset=subset, eval_hops=eval_hops)
-    run.log({f"results{postfix}/hit": hit})
+    if run is not None:
+        run.log({f"results{postfix}/hit": hit})
 
     # 追加到 CSV（若指定 csv_path）
     if csv_path is not None:
         csv_path = Path(csv_path)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         header = [
-            "experiment_name", "subset", "split", "hit1", "macro_f1", "macro_precision", "macro_recall",
+            "experiment_name", "subset", "split", "hit1", "hit", "macro_f1", "macro_precision", "macro_recall",
             "exact_match", "totally_wrong", "micro_f1", "micro_precision", "micro_recall", "total_cnt",
-            "no_ans_cnt", "no_ans_ratio", "hal_score", "hit"
+            "no_ans_cnt", "no_ans_ratio", "hal_score"
         ]
         # 格式與 aggregated_eval.csv 一致，對於未知的欄位使用空字串
         row = [
             experiment_name if experiment_name is not None else "",
             "sub" if subset else "full",
             split if split is not None else "",
-            hit1, f1, prec, recall, em, tw, "", "", "", "", "", "", hal_score, ""
+            hit1, hit, f1, prec, recall, em, tw, mi_f1, mi_prec, mi_recall, total_cnt, no_ans_cnt, no_ans_ratio, hal_score
         ]
         write_header = not csv_path.exists()
+
+        # 若已存在舊版 CSV（缺少 hit 欄位），自動升級：在 hit1 後插入 hit，舊資料以空字串補位
+        if not write_header:
+            try:
+                with open(csv_path, "r") as f:
+                    lines = f.readlines()
+                if lines:
+                    old_header = lines[0].strip().split(",")
+                    if "hit" not in old_header:
+                        if "hit1" in old_header:
+                            insert_pos = old_header.index("hit1") + 1
+                        else:
+                            insert_pos = 3  # 預期位置（experiment_name, subset, split 之後）
+                        new_header = old_header[:insert_pos] + ["hit"] + old_header[insert_pos:]
+                        upgraded_lines = [",".join(new_header) + "\n"]
+                        for line in lines[1:]:
+                            cols = line.rstrip("\n").split(",")
+                            # 將缺少欄位的行補齊
+                            if len(cols) < len(new_header) - 1:
+                                # 對極端不一致情況，直接跳過升級，保留原行
+                                upgraded_lines.append(line)
+                                continue
+                            cols = cols[:insert_pos] + [""] + cols[insert_pos:]
+                            upgraded_lines.append(",".join(cols) + "\n")
+                        with open(csv_path, "w") as f:
+                            f.writelines(upgraded_lines)
+            except Exception:
+                pass
+
         with open(csv_path, "a") as f:
             if write_header:
                 f.write(",".join(header) + "\n")
@@ -167,7 +199,7 @@ def check_experiment_status(retrieval_path, args):
 
 def auto_run_all_retrieval_files(args):
     """自動運行指定目錄下所有的 retrieval_result.pth 檔案"""
-    base_dir = f"/home/SubgraphRAG/retrieve/results/training/{args.dataset_name}"
+    base_dir = f"/home/YX_thesis/retrieve/results/training/{args.dataset_name}"
     
     if not os.path.exists(base_dir):
         print(f"Error: Base directory {base_dir} does not exist!")
@@ -257,7 +289,13 @@ def run_single_experiment(args):
     temperature = args.temperature
     frequency_penalty = args.frequency_penalty
     thres = args.thres
-
+    reverse_order = getattr(args, "reverse_order", False)
+    run_mode = getattr(args, "run_mode", "both")
+    pred_file_arg = getattr(args, "pred_file", None)
+    
+    do_infer = run_mode in ("both", "infer")
+    do_eval = run_mode in ("both", "eval")
+    
     # 預測結果檔案路徑（RoG baseline 用）
     pred_file_path = f"./results/KGQA/{dataset_name}/RoG/{split}/results_gen_rule_path_RoG-{dataset_name}_RoG_{split}_predictions_3_False_jsonl/predictions.jsonl"
     if not os.path.exists(pred_file_path):
@@ -269,17 +307,19 @@ def run_single_experiment(args):
     run_name = f"{model_name}-{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}"
     # 初始化 wandb，config 需轉成 dict
     run = wandb.init(project=f"RAG-{dataset_name}", name=run_name, config=vars(args))
-
+    
     # 決定 score_dict_path
-    if args.score_dict_path is None:
-        print("score_dict_path not been assigned")
-        exit()
-    else:
-        score_dict_path = args.score_dict_path
-    # 移除路徑前後空白避免 FileNotFoundError
-    if isinstance(score_dict_path, str):
-        score_dict_path = score_dict_path.strip()
-
+    score_dict_path = None
+    if do_infer:
+        if args.score_dict_path is None:
+            print("score_dict_path not been assigned")
+            exit()
+        else:
+            score_dict_path = args.score_dict_path
+            # 移除路徑前後空白避免 FileNotFoundError
+            if isinstance(score_dict_path, str):
+                score_dict_path = score_dict_path.strip()
+    
     # 預測結果暫存檔案夾與檔案路徑（支援 resume）
     raw_pred_folder_path = Path(f"./results/KGQA/{dataset_name}/SubgraphRAG/{args.model_name.split('/')[-1]}")
     raw_pred_folder_path.mkdir(parents=True, exist_ok=True)
@@ -288,63 +328,130 @@ def run_single_experiment(args):
     unified_csv_path = raw_pred_folder_path / "all_experiments_metrics.csv"
     
     # 提取實驗 ID
-    experiment_id = extract_experiment_id_from_path(score_dict_path, dataset_name)
-    if experiment_id is None:
-        # 如果無法從路徑提取，則使用時間戳作為備用
-        experiment_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        print(f"Warning: Could not extract experiment ID from score_dict_path, using timestamp: {experiment_id}")
+    experiment_id = None
+    if do_infer:
+        experiment_id = extract_experiment_id_from_path(score_dict_path, dataset_name)
+        if experiment_id is None:
+            # 如果無法從路徑提取，則使用時間戳作為備用
+            experiment_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            print(f"Warning: Could not extract experiment ID from score_dict_path, using timestamp: {experiment_id}")
+    elif do_eval and pred_file_arg is not None:
+        # eval-only 且使用外部 predictions 檔案時，嘗試從檔案路徑推斷實驗 ID（僅用於 CSV 命名與日誌）
+        try:
+            experiment_id = extract_experiment_id_from_path(pred_file_arg, dataset_name)
+        except Exception:
+            experiment_id = None
     
     # 建立實驗 ID 資料夾（用於存放實驗特定檔案）
-    experiment_folder_path = raw_pred_folder_path / experiment_id
-    if experiment_folder_path.exists():
-        print(f"使用現有的實驗資料夾: {experiment_folder_path}")
-    else:
-        experiment_folder_path.mkdir(parents=True, exist_ok=True)
-        print(f"建立新的實驗資料夾: {experiment_folder_path}")
+    experiment_folder_path = None
+    if experiment_id is not None:
+        experiment_folder_path = raw_pred_folder_path / experiment_id
+        if experiment_folder_path.exists():
+            print(f"使用現有的實驗資料夾: {experiment_folder_path}")
+        else:
+            experiment_folder_path.mkdir(parents=True, exist_ok=True)
+            print(f"建立新的實驗資料夾: {experiment_folder_path}")
     
     # 建立實驗名稱（用於 CSV 記錄，格式與 aggregated_eval.csv 一致）
-    experiment_name = f"{experiment_id}-{prompt_mode}"
+    # Include llm_mode in experiment name for clearer comparison across modes
+    if experiment_id is not None:
+        experiment_name = f"{experiment_id}-{prompt_mode}-{llm_mode}"
+    else:
+        experiment_name = f"{prompt_mode}-{llm_mode}"
+    if reverse_order:
+        experiment_name += "_rev_seq"
     
     # 實驗特定檔案路徑（存到實驗 ID 資料夾）
-    raw_pred_file_path = experiment_folder_path / f"{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}-predictions-resume.jsonl"
+    raw_pred_file_path = None
+    if do_infer:
+        raw_pred_file_path = experiment_folder_path / f"{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}-predictions-resume.jsonl"
+    
+    # 在單檔模式也檢查是否已完成/部分完成，並處理 --force_rerun（僅在 inference 時）
+    final_pred_file_path = None
+    if experiment_folder_path is not None:
+        final_pred_file_path = experiment_folder_path / f"{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}-predictions.jsonl"
+    if do_infer and final_pred_file_path is not None:
+        if final_pred_file_path.exists() and not args.force_rerun:
+            print(f"Detected existing final result. Skip since --force_rerun not set: {final_pred_file_path}")
+            return
+        if args.force_rerun:
+            # 強制重跑時，清理既有輸出
+            try:
+                if final_pred_file_path.exists():
+                    print(f"--force_rerun: removing existing final result {final_pred_file_path}")
+                    os.remove(final_pred_file_path)
+            except Exception as e:
+                print(f"Warning: failed to remove final file: {e}")
+            try:
+                if raw_pred_file_path is not None and raw_pred_file_path.exists():
+                    print(f"--force_rerun: removing existing resume file {raw_pred_file_path}")
+                    os.remove(raw_pred_file_path)
+            except Exception as e:
+                print(f"Warning: failed to remove resume file: {e}")
+        else:
+            # 非強制時，如有暫存檔會自動續跑（下方 load_checkpoint 會處理）
+            if raw_pred_file_path is not None and raw_pred_file_path.exists():
+                print(f"Found resume file. Will auto-resume from checkpoint: {raw_pred_file_path}")
+    
+    if do_infer:
+        # 初始化 LLM
+        llm = llm_init(model_name, tensor_parallel_size, max_seq_len_to_capture, max_tokens, seed, temperature, frequency_penalty)
+        # 取得資料
+        data = get_data(dataset_name, pred_file_path, score_dict_path, split, prompt_mode)
+        # 取得 prompt
+        sys_prompt, cot_prompt = get_defined_prompts(prompt_mode, model_name, llm_mode)
+        print("Generating prompts...")
+        # 產生每筆資料的 prompt
+        data = get_prompts_for_data(data, prompt_mode, sys_prompt, cot_prompt, thres)
+    
+        print("Starting inference...")
+        # 取得已處理的資料數（支援 resume）
+        start_idx = len(load_checkpoint(raw_pred_file_path))
+        with open(raw_pred_file_path, "a") as pred_file:
+            # 逐筆進行推論
+            for idx, each_qa in enumerate(tqdm(data[start_idx:], initial=start_idx, total=len(data))):
+                res = llm_inf_all(llm, each_qa, llm_mode, model_name)
 
-    # 初始化 LLM
-    llm = llm_init(model_name, tensor_parallel_size, max_seq_len_to_capture, max_tokens, seed, temperature, frequency_penalty)
-    # 取得資料
-    data = get_data(dataset_name, pred_file_path, score_dict_path, split, prompt_mode)
-    # 取得 prompt
-    sys_prompt, cot_prompt = get_defined_prompts(prompt_mode, model_name, llm_mode)
-    print("Generating prompts...")
-    # 產生每筆資料的 prompt
-    data = get_prompts_for_data(data, prompt_mode, sys_prompt, cot_prompt, thres)
+                # 移除不需要儲存的欄位，減少檔案大小（若不存在則忽略）
+                for k in ["graph", "good_paths_rog", "good_triplets_rog", "scored_triplets"]:
+                    each_qa.pop(k, None)
 
-    print("Starting inference...")
-    # 取得已處理的資料數（支援 resume）
-    start_idx = len(load_checkpoint(raw_pred_file_path))
-    with open(raw_pred_file_path, "a") as pred_file:
-        # 逐筆進行推論
-        for idx, each_qa in enumerate(tqdm(data[start_idx:], initial=start_idx, total=len(data))):
-            res = llm_inf_all(llm, each_qa, llm_mode, model_name)
+                # 儲存預測結果
+                each_qa["prediction"] = res[0]
+                save_checkpoint(pred_file, each_qa)
+    
+        # 處理完成後，將檔案重新命名（移除 -resume）
+        final_pred_file_path = raw_pred_file_path.with_name(raw_pred_file_path.stem.replace("-resume", "") + raw_pred_file_path.suffix)
+        os.rename(raw_pred_file_path, final_pred_file_path)
+    
+    # 僅在需要評估時執行評估；允許直接指定外部 predictions 檔案
+    if do_eval:
+        target_pred_path = None
+        if do_infer:
+            target_pred_path = final_pred_file_path
+        else:
+            if pred_file_arg is not None:
+                target_pred_path = Path(pred_file_arg)
+            elif experiment_folder_path is not None:
+                candidate = experiment_folder_path / f"{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}-predictions.jsonl"
+                target_pred_path = candidate
+            else:
+                print("Error: No predictions file provided for eval-only mode. Use --pred_file to specify the path.")
+                return
 
-            # 移除不需要儲存的欄位，減少檔案大小
-            del each_qa["graph"], each_qa["good_paths_rog"], each_qa["good_triplets_rog"], each_qa["scored_triplets"]
+        if not Path(target_pred_path).exists():
+            print(f"Error: Predictions file not found for evaluation: {target_pred_path}")
+            return
 
-            # 儲存預測結果
-            each_qa["prediction"] = res[0]
-            save_checkpoint(pred_file, each_qa)
-
-    # 處理完成後，將檔案重新命名（移除 -resume）
-    final_pred_file_path = raw_pred_file_path.with_name(raw_pred_file_path.stem.replace("-resume", "") + raw_pred_file_path.suffix)
-    os.rename(raw_pred_file_path, final_pred_file_path)
-    # 進行評估，並將結果 append 到統一 CSV
-    eval_all(final_pred_file_path, run, subset=True, split=split, experiment_name=experiment_name, csv_path=unified_csv_path)
-    eval_all(final_pred_file_path, run, subset=False, split=split, experiment_name=experiment_name, csv_path=unified_csv_path)
+        # 進行評估，並將結果 append 到統一 CSV
+        eval_all(target_pred_path, run, subset=True, split=split, experiment_name=experiment_name, csv_path=unified_csv_path, reverse_order=reverse_order)
+        eval_all(target_pred_path, run, subset=False, split=split, experiment_name=experiment_name, csv_path=unified_csv_path, reverse_order=reverse_order)
 
 # 主程式入口，負責整個流程的控制
 def main():
     # 解析命令列參數
     parser = argparse.ArgumentParser(description="RAG for KGQA")
-    parser.add_argument("-d", "--dataset_name", type=str, default="cwq", help="Dataset name")
+    parser.add_argument("-d", "--dataset_name", type=str, default="webqsp", help="Dataset name")
     parser.add_argument("--prompt_mode", type=str, default="scored_100", help="Prompt mode")
     parser.add_argument("-p", "--score_dict_path", type=str)
     parser.add_argument("--llm_mode", type=str, default="sys_icl_dc", help="LLM mode")
@@ -359,6 +466,9 @@ def main():
     parser.add_argument("--thres", type=float, default=0.0, help="Threshold")
     parser.add_argument("--auto_run_all", action="store_true", help="Automatically run all retrieval_result.pth files in training directory")
     parser.add_argument("--force_rerun", action="store_true", help="Force rerun even if results already exist")
+    parser.add_argument("--run_mode", type=str, choices=["both", "infer", "eval"], default="both", help="Run only inference, only evaluation, or both")
+    parser.add_argument("--pred_file", type=str, default=None, help="Path to an existing predictions.jsonl for eval-only mode")
+    parser.add_argument("-rev", "--reverse_order", action="store_true", help="Reverse the order of triplets for evaluation")
 
     args = parser.parse_args()
     

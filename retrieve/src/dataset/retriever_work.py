@@ -4,6 +4,7 @@ import os
 import pickle
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from collections import defaultdict
 import gc
 import random
@@ -30,28 +31,69 @@ class LazyEmbeddingDict:
         self._create_sample_mapping()
     
     def _create_sample_mapping(self):
-        """創建樣本ID到批次文件的映射"""
+        """創建樣本ID到批次文件的映射 - 超優化版本"""
         
-        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Mapping sample IDs", unit="batch")):
+        # 方案4+: 進一步優化
+        batch_count = 0
+        total_samples = 0
+        
+        # 優化1: 預分配字典大小（如果可能的話）
+        # 如果知道大概的樣本數量，可以預分配
+        # self._sample_to_batch = {}
+        
+        # 優化2: 使用更高效的進度條設置
+        pbar = tqdm(self.batch_files, desc="Mapping sample IDs", unit="batch", 
+                    mininterval=0.5, maxinterval=2.0)  # 減少進度條更新頻率
+        
+        for batch_idx, batch_file in enumerate(pbar):
             batch_path = os.path.join(self.batch_dir, batch_file)
             
             try:
-                # 載入批次文件來獲取樣本ID
-                batch_data = torch.load(batch_path, map_location='cpu')
+                # 優化3: 使用更高效的torch.load選項
+                batch_data = torch.load(batch_path, map_location='cpu', weights_only=False)
                 
-                # 為每個樣本創建映射
-                for sample_id in batch_data.keys():
+                # 優化4: 直接使用生成器表達式，避免創建中間字典
+                sample_ids = batch_data.keys()
+                batch_samples = len(batch_data)
+                
+                # 優化5: 使用更高效的批量更新
+                # 方法A: 直接賦值（如果字典不大）
+                for sample_id in sample_ids:
                     self._sample_to_batch[sample_id] = batch_idx
                 
-                # 立即清理
-                del batch_data
-                gc.collect()
+                # 或者方法B: 使用update（如果批次很大）
+                # batch_mapping = {sample_id: batch_idx for sample_id in sample_ids}
+                # self._sample_to_batch.update(batch_mapping)
                 
+                # 統計信息
+                total_samples += batch_samples
+                batch_count += 1
+                
+                # 優化6: 立即清理，避免內存累積
+                del batch_data
+                
+                # 優化7: 更智能的GC調用策略
+                if batch_count % 10 == 0:  # 減少GC調用頻率
+                    gc.collect()
+                
+                # 優化8: 動態更新進度條描述
+                if batch_count % 20 == 0:
+                    pbar.set_postfix({
+                        'samples': len(self._sample_to_batch),
+                        'avg_per_batch': f"{total_samples / batch_count:.1f}"
+                    })
+                    
             except Exception as e:
-                tqdm.write(f"Error loading {batch_file} for mapping: {e}")
+                tqdm.write(f"Error loading {batch_file}: {e}")
                 continue
         
-        print(f"Created mapping for {len(self._sample_to_batch)} samples")
+        pbar.close()
+        
+        # 優化9: 最終清理
+        gc.collect()
+        
+        print(f"✅ Created mapping for {len(self._sample_to_batch)} samples from {batch_count} batches")
+        print(f"📊 Average samples per batch: {total_samples / batch_count if batch_count > 0 else 0:.1f}")
     
     def _load_batch_to_cache(self, batch_idx):
         """載入批次到緩存"""
@@ -915,173 +957,170 @@ class SmartBatchRetrieverDataset:
         
         return sample
 
-# 導入 LazyEmbeddingDict (已在文件頂部定義)
-
-class OptimizedRetrieverDataset:
-    """
-    真正的小批次載入 Dataset，避免在初始化時載入所有嵌入
-    保持與 RetrieverDataset 相同的行為，包括 DataLoader shuffle
-    """
-    def __init__(
-        self,
-        config,
-        split,
-        skip_no_path=True,
-        freq_weight=False,
-        samples_per_epoch: int | None = None,
-        samples_per_batch_load: int | None = None,
-        cache_size=8
-    ):
-        self.config = config
-        self.split = split
-        self.skip_no_path = skip_no_path
-        self.freq_weight = freq_weight
-        self.samples_per_epoch = samples_per_epoch
-        self.samples_per_batch_load = samples_per_batch_load
-        self.cache_size = cache_size
+# class OptimizedRetrieverDataset:
+#     """
+#     真正的小批次載入 Dataset，避免在初始化時載入所有嵌入
+#     保持與 RetrieverDataset 相同的行為，包括 DataLoader shuffle
+#     """
+#     def __init__(
+#         self,
+#         config,
+#         split,
+#         skip_no_path=True,
+#         freq_weight=False,
+#         samples_per_epoch: int | None = None,
+#         samples_per_batch_load: int | None = None,
+#         cache_size=8
+#     ):
+#         self.config = config
+#         self.split = split
+#         self.skip_no_path = skip_no_path
+#         self.freq_weight = freq_weight
+#         self.samples_per_epoch = samples_per_epoch
+#         self.samples_per_batch_load = samples_per_batch_load
+#         self.cache_size = cache_size
         
-        dataset_name = config['dataset']['name']
+#         dataset_name = config['dataset']['name']
         
-        # 載入輕量級資料（不包含嵌入）
-        self.processed_dict_list = self._load_processed(dataset_name, split)
-        self.triple_score_dict = self._get_triple_scores(
-            dataset_name, split, self.processed_dict_list, freq_weight)
+#         # 載入輕量級資料（不包含嵌入）
+#         self.processed_dict_list = self._load_processed(dataset_name, split)
+#         self.triple_score_dict = self._get_triple_scores(
+#             dataset_name, split, self.processed_dict_list, freq_weight)
         
-        # 智能嵌入載入策略
-        self.emb_dict = self._smart_load_embeddings(
-            dataset_name, config['dataset']['text_encoder_name'], split)
+#         # 智能嵌入載入策略
+#         self.emb_dict = self._smart_load_embeddings(
+#             dataset_name, config['dataset']['text_encoder_name'], split)
         
-        # 過濾有效樣本（不載入嵌入）
-        self.valid_sample_ids = self._filter_valid_samples()
+#         # 過濾有效樣本（不載入嵌入）
+#         self.valid_sample_ids = self._filter_valid_samples()
         
-        # 計算統計資訊
-        self._compute_statistics()
+#         # 計算統計資訊
+#         self._compute_statistics()
         
-        print(f"✅ OptimizedRetrieverDataset initialized with {len(self.valid_sample_ids)} valid samples")
-        print(f"📊 Memory-efficient loading: embeddings loaded on-demand")
+#         print(f"✅ OptimizedRetrieverDataset initialized with {len(self.valid_sample_ids)} valid samples")
+#         print(f"📊 Memory-efficient loading: embeddings loaded on-demand")
     
-    def _load_processed(self, dataset_name, split):
-        """載入處理過的資料"""
-        processed_file = os.path.join(f'data_files/{dataset_name}/processed/{split}.pkl')
-        with open(processed_file, 'rb') as f:
-            return pickle.load(f)
+#     def _load_processed(self, dataset_name, split):
+#         """載入處理過的資料"""
+#         processed_file = os.path.join(f'data_files/{dataset_name}/processed/{split}.pkl')
+#         with open(processed_file, 'rb') as f:
+#             return pickle.load(f)
     
-    def _get_triple_scores(self, dataset_name, split, processed_dict_list, freq_weight=False):
-        """載入 triple scores"""
-        if freq_weight:
-            save_dir = os.path.join('data_files', dataset_name, 'triple_scores_freq_weight')
-        else:
-            save_dir = os.path.join('data_files', dataset_name, 'triple_scores')
+#     def _get_triple_scores(self, dataset_name, split, processed_dict_list, freq_weight=False):
+#         """載入 triple scores"""
+#         if freq_weight:
+#             save_dir = os.path.join('data_files', dataset_name, 'triple_scores_freq_weight')
+#         else:
+#             save_dir = os.path.join('data_files', dataset_name, 'triple_scores')
         
-        save_file = os.path.join(save_dir, f'{split}.pth')
-        if os.path.exists(save_file):
-            return torch.load(save_file)
+#         save_file = os.path.join(save_dir, f'{split}.pth')
+#         if os.path.exists(save_file):
+#             return torch.load(save_file)
         
-        raise FileNotFoundError(f"Triple scores not found: {save_file}")
+#         raise FileNotFoundError(f"Triple scores not found: {save_file}")
     
-    def _smart_load_embeddings(self, dataset_name, text_encoder_name, split):
-        """智能載入策略：自動檢測最佳載入方式"""
-        # 1. 檢查是否有合併檔案
-        merged_file = f'data_files/{dataset_name}/emb/{text_encoder_name}/{split}.pth'
-        if os.path.exists(merged_file):
-            print(f"✅ Found merged file, using full loading: {merged_file}")
-            return torch.load(merged_file)
+#     def _smart_load_embeddings(self, dataset_name, text_encoder_name, split):
+#         """智能載入策略：自動檢測最佳載入方式"""
+#         # 1. 檢查是否有合併檔案
+#         merged_file = f'data_files/{dataset_name}/emb/{text_encoder_name}/{split}.pth'
+#         if os.path.exists(merged_file):
+#             print(f"✅ Found merged file, using full loading: {merged_file}")
+#             return torch.load(merged_file)
         
-        # 2. 檢查批次檔案
-        batch_dir = f'data_files/{dataset_name}/emb/{text_encoder_name}'
-        if os.path.exists(batch_dir):
-            batch_files = [f for f in os.listdir(batch_dir) 
-                          if f.startswith(f'{split}_batch_') and f.endswith('.pth')]
-            if batch_files:
-                print(f"✅ Found {len(batch_files)} batch files, using lazy loading")
-                return LazyEmbeddingDict(batch_dir, batch_files, cache_size=self.cache_size)
+#         # 2. 檢查批次檔案
+#         batch_dir = f'data_files/{dataset_name}/emb/{text_encoder_name}'
+#         if os.path.exists(batch_dir):
+#             batch_files = [f for f in os.listdir(batch_dir) 
+#                           if f.startswith(f'{split}_batch_') and f.endswith('.pth')]
+#             if batch_files:
+#                 print(f"✅ Found {len(batch_files)} batch files, using lazy loading")
+#                 return LazyEmbeddingDict(batch_dir, batch_files, cache_size=self.cache_size)
         
-        raise FileNotFoundError(f"No embeddings found for {dataset_name}/{text_encoder_name}/{split}")
+#         raise FileNotFoundError(f"No embeddings found for {dataset_name}/{text_encoder_name}/{split}")
     
-    def _filter_valid_samples(self):
-        """過濾有效樣本（不載入嵌入）"""
-        valid_ids = []
-        for sample in self.processed_dict_list:
-            sample_id = sample['id']
+#     def _filter_valid_samples(self):
+#         """過濾有效樣本（不載入嵌入）"""
+#         valid_ids = []
+#         for sample in self.processed_dict_list:
+#             sample_id = sample['id']
             
-            # 檢查嵌入是否存在
-            if sample_id not in self.emb_dict:
-                continue
+#             # 檢查嵌入是否存在
+#             if sample_id not in self.emb_dict:
+#                 continue
             
-            # 檢查路徑是否有效
-            if sample_id not in self.triple_score_dict:
-                continue
+#             # 檢查路徑是否有效
+#             if sample_id not in self.triple_score_dict:
+#                 continue
                 
-            max_path_length = self.triple_score_dict[sample_id]['max_path_length']
-            if self.skip_no_path and (max_path_length in [None, 0]):
-                continue
+#             max_path_length = self.triple_score_dict[sample_id]['max_path_length']
+#             if self.skip_no_path and (max_path_length in [None, 0]):
+#                 continue
             
-            valid_ids.append(sample_id)
+#             valid_ids.append(sample_id)
         
-        return valid_ids
+#         return valid_ids
     
-    def _compute_statistics(self):
-        """計算統計資訊"""
-        num_relevant_triples = []
-        for sample_id in self.valid_sample_ids:
-            triple_score = self.triple_score_dict[sample_id]['triple_scores']
-            num_relevant_triples_i = len(triple_score.nonzero())
-            num_relevant_triples.append(num_relevant_triples_i)
+#     def _compute_statistics(self):
+#         """計算統計資訊"""
+#         num_relevant_triples = []
+#         for sample_id in self.valid_sample_ids:
+#             triple_score = self.triple_score_dict[sample_id]['triple_scores']
+#             num_relevant_triples_i = len(triple_score.nonzero())
+#             num_relevant_triples.append(num_relevant_triples_i)
         
-        if num_relevant_triples:
-            self.median_num_relevant = int(np.median(num_relevant_triples))
-            self.mean_num_relevant = int(np.mean(num_relevant_triples))
-            self.max_num_relevant = int(np.max(num_relevant_triples))
-        else:
-            self.median_num_relevant = 0
-            self.mean_num_relevant = 0
-            self.max_num_relevant = 0
+#         if num_relevant_triples:
+#             self.median_num_relevant = int(np.median(num_relevant_triples))
+#             self.mean_num_relevant = int(np.mean(num_relevant_triples))
+#             self.max_num_relevant = int(np.max(num_relevant_triples))
+#         else:
+#             self.median_num_relevant = 0
+#             self.mean_num_relevant = 0
+#             self.max_num_relevant = 0
         
-        self.num_skipped = len(self.processed_dict_list) - len(self.valid_sample_ids)
+#         self.num_skipped = len(self.processed_dict_list) - len(self.valid_sample_ids)
         
-        print(f'# skipped samples: {self.num_skipped}')
-        print(f'# relevant triples | median: {self.median_num_relevant} | mean: {self.mean_num_relevant} | max: {self.max_num_relevant}')
+#         print(f'# skipped samples: {self.num_skipped}')
+#         print(f'# relevant triples | median: {self.median_num_relevant} | mean: {self.mean_num_relevant} | max: {self.max_num_relevant}')
     
-    def __len__(self):
-        """返回有效樣本數量"""
-        return len(self.valid_sample_ids)
+#     def __len__(self):
+#         """返回有效樣本數量"""
+#         return len(self.valid_sample_ids)
     
-    def __getitem__(self, idx):
-        """按索引存取樣本，支援 DataLoader shuffle"""
-        sample_id = self.valid_sample_ids[idx]
+#     def __getitem__(self, idx):
+#         """按索引存取樣本，支援 DataLoader shuffle"""
+#         sample_id = self.valid_sample_ids[idx]
         
-        # 找到對應的 processed sample
-        sample = None
-        for s in self.processed_dict_list:
-            if s['id'] == sample_id:
-                sample = s.copy()
-                break
+#         # 找到對應的 processed sample
+#         sample = None
+#         for s in self.processed_dict_list:
+#             if s['id'] == sample_id:
+#                 sample = s.copy()
+#                 break
         
-        if sample is None:
-            raise KeyError(f"Sample {sample_id} not found")
+#         if sample is None:
+#             raise KeyError(f"Sample {sample_id} not found")
         
-        # 添加 triple scores
-        triple_score_info = self.triple_score_dict[sample_id]
-        sample['target_triple_probs'] = triple_score_info['triple_scores']
-        sample['max_path_length'] = triple_score_info['max_path_length']
+#         # 添加 triple scores
+#         triple_score_info = self.triple_score_dict[sample_id]
+#         sample['target_triple_probs'] = triple_score_info['triple_scores']
+#         sample['max_path_length'] = triple_score_info['max_path_length']
         
-        # 懶加載嵌入資料（只在需要時載入）
-        sample_emb_data = self.emb_dict[sample_id]
-        sample.update(sample_emb_data)
+#         # 懶加載嵌入資料（只在需要時載入）
+#         sample_emb_data = self.emb_dict[sample_id]
+#         sample.update(sample_emb_data)
         
-        # 清理和格式化
-        sample['a_entity'] = list(set(sample['a_entity']))
-        sample['a_entity_id_list'] = list(set(sample['a_entity_id_list']))
+#         # 清理和格式化
+#         sample['a_entity'] = list(set(sample['a_entity']))
+#         sample['a_entity_id_list'] = list(set(sample['a_entity_id_list']))
         
-        # PE for topic entities
-        num_entities = len(sample['text_entity_list']) + len(sample['non_text_entity_list'])
-        topic_entity_mask = torch.zeros(num_entities)
-        topic_entity_mask[sample['q_entity_id_list']] = 1.
-        topic_entity_one_hot = F.one_hot(topic_entity_mask.long(), num_classes=2)
-        sample['topic_entity_one_hot'] = topic_entity_one_hot.float()
+#         # PE for topic entities
+#         num_entities = len(sample['text_entity_list']) + len(sample['non_text_entity_list'])
+#         topic_entity_mask = torch.zeros(num_entities)
+#         topic_entity_mask[sample['q_entity_id_list']] = 1.
+#         topic_entity_one_hot = F.one_hot(topic_entity_mask.long(), num_classes=2)
+#         sample['topic_entity_one_hot'] = topic_entity_one_hot.float()
         
-        return sample
-
+#         return sample
 
 # =============================================================================
 # 優化的 collate 函數
@@ -1561,3 +1600,204 @@ class ImprovedRandomBatchRetrieverDataset:
         
         return prepared_samples
 
+# =============================================================================
+# latest issue
+# =============================================================================
+
+class OptimizedRetrieverDataset:
+    """
+    真正符合 PyTorch 設計理念的優化版 Dataset。
+    - __init__: 只做最輕量級的初始化 (讀取 metadata)。
+    - __getitem__: 負責載入並準備一個完整的樣本。
+    將批次處理、Shuffle、多線程預取等工作完全交給 DataLoader。
+    """
+    def __init__(self, config, split, skip_no_path=True, freq_weight=False):
+        # --- 初始化階段：只載入輕量級 metadata ---
+        print(f"Initializing {split} set (lightweight)...")
+        self.config = config
+        self.split = split
+        self.skip_no_path = skip_no_path
+        self.freq_weight = freq_weight
+        dataset_name = config['dataset']['name']
+
+        # 1. 載入 processed data (通常是 .pkl，很快)
+        processed_file = os.path.join(f'data_files/{dataset_name}/processed/{split}.pkl')
+        with open(processed_file, 'rb') as f:
+            self.processed_dict_list = pickle.load(f)
+
+        # 2. 載入 triple scores (通常是 .pth，很快)
+        self.triple_score_dict = self._load_triple_scores(dataset_name, split, freq_weight)
+
+        # 3. 懶加載 Embeddings (只建立 LazyEmbeddingDict 對象，不讀取數據)
+        self.emb_dict = self._setup_lazy_embeddings(dataset_name, config['dataset']['text_encoder_name'], split)
+        
+        # 4. 過濾出有效的樣本 ID 列表
+        # 這個列表的順序將是 DataLoader 索引的依據
+        self.valid_sample_ids = self._filter_valid_samples()
+        
+        # 5. 【新增】計算並儲存統計數據
+        self._compute_statistics()
+        
+        print(f"✅ Initialized {split} set with {len(self.valid_sample_ids)} valid samples.")
+        print(f"   - Skipped samples: {self.num_skipped}")
+        print(f"   - Relevant triples (median): {self.median_num_relevant}")
+        print(f"   Embeddings will be loaded on-demand by DataLoader workers.")
+
+    def __len__(self):
+        """返回有效樣本的總數"""
+        return len(self.valid_sample_ids)
+
+    def __getitem__(self, idx):
+        """
+        DataLoader 的核心！根據索引 idx 獲取單一完整樣本。
+        這個函數會被多個 worker 並行調用。
+        """
+        # 1. 從有效 ID 列表中獲取 sample_id
+        sample_id = self.valid_sample_ids[idx]
+
+        # 2. 找到對應的 metadata (從記憶體中，很快)
+        # 使用 dict 以加速查找，而不是 list 遍歷
+        if not hasattr(self, 'processed_map'):
+             self.processed_map = {s['id']: s for s in self.processed_dict_list}
+        
+        sample = self.processed_map[sample_id].copy()
+
+        # 3. 添加 triple scores (從記憶體中，很快)
+        triple_score_info = self.triple_score_dict[sample_id]
+        sample['target_triple_probs'] = triple_score_info['triple_scores']
+        
+        # 4. **執行 I/O 操作**: 使用 LazyEmbeddingDict 懶加載此樣本的 embedding
+        # 這是最耗時的步驟，但會被多個 worker 並行處理
+        sample_emb_data = self.emb_dict[sample_id]
+        sample.update(sample_emb_data)
+
+        # 5. 進行最後的資料處理
+        sample['a_entity_id_list'] = list(set(sample['a_entity_id_list']))
+        
+        num_entities = len(sample['text_entity_list']) + len(sample['non_text_entity_list'])
+        topic_entity_mask = torch.zeros(num_entities)
+        if sample['q_entity_id_list']:
+            topic_entity_mask[sample['q_entity_id_list']] = 1.
+        sample['topic_entity_one_hot'] = F.one_hot(topic_entity_mask.long(), num_classes=2).float()
+        
+        return sample
+
+    # --- 以下是輔助函數 ---
+
+    def _load_triple_scores(self, dataset_name, split, freq_weight):
+        save_dir = os.path.join('data_files', dataset_name, 
+                                'triple_scores_freq_weight' if freq_weight else 'triple_scores')
+        save_file = os.path.join(save_dir, f'{split}.pth')
+        if not os.path.exists(save_file):
+            raise FileNotFoundError(f"Triple scores not found: {save_file}")
+        return torch.load(save_file)
+
+    def _setup_lazy_embeddings(self, dataset_name, text_encoder_name, split):
+        # 先嘗試合併檔（webqsp 等小數據集）
+        merged_file = f'data_files/{dataset_name}/emb/{text_encoder_name}/{split}.pth'
+        if os.path.exists(merged_file):
+            print(f"✅ Found merged embedding file: {merged_file}")
+            return torch.load(merged_file, map_location='cpu')
+        
+        # 否則使用分批檔（cwq 等大數據集）
+        batch_dir = f'data_files/{dataset_name}/emb/{text_encoder_name}'
+        batch_files = sorted([f for f in os.listdir(batch_dir)
+                              if f.startswith(f'{split}_batch_') and f.endswith('.pth')],
+                             key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        if not batch_files:
+            raise FileNotFoundError(f"No embeddings found for split {split}: neither merged file nor batch files present in {batch_dir}")
+        
+        # 建議 cache_size 與 num_workers 數量相關
+        return LazyEmbeddingDict(batch_dir, batch_files, cache_size=16)
+
+    def _filter_valid_samples(self):
+        """過濾出在所有資料源中都存在的樣本ID"""
+        valid_ids = []
+        processed_ids = {s['id'] for s in self.processed_dict_list}
+
+        for sample_id in tqdm(self.emb_dict.keys(), desc="Filtering valid samples"):
+            if sample_id not in processed_ids:
+                continue
+            if sample_id not in self.triple_score_dict:
+                continue
+            
+            # skip_no_path 邏輯
+            max_path_length = self.triple_score_dict[sample_id].get('max_path_length')
+            if self.skip_no_path and (max_path_length is None or max_path_length == 0):
+                continue
+            
+            valid_ids.append(sample_id)
+        return valid_ids
+    
+    def _compute_statistics(self):
+        """
+        在初始化結束時計算一次統計數據。
+        """
+        print("📊 Computing statistics for the dataset...")
+        
+        # 1. 計算跳過的樣本數
+        total_processed = len(self.processed_dict_list)
+        valid_samples = len(self.valid_sample_ids)
+        self.num_skipped = total_processed - valid_samples
+
+        # 2. 計算相關 triple 的統計
+        num_relevant_triples = []
+        if not self.valid_sample_ids:
+            # 如果沒有有效樣本，設定預設值
+            self.median_num_relevant = 0
+            self.mean_num_relevant = 0
+            self.max_num_relevant = 0
+            return
+
+        for sample_id in self.valid_sample_ids:
+            # 確保 triple_score_dict 中有這個 key
+            if sample_id in self.triple_score_dict:
+                triple_score = self.triple_score_dict[sample_id]['triple_scores']
+                num_relevant_triples.append(len(triple_score.nonzero()))
+        
+        if num_relevant_triples:
+            self.median_num_relevant = int(np.median(num_relevant_triples))
+            self.mean_num_relevant = int(np.mean(num_relevant_triples))
+            self.max_num_relevant = int(np.max(num_relevant_triples))
+        else:
+            self.median_num_relevant = 0
+            self.mean_num_relevant = 0
+            self.max_num_relevant = 0
+    
+def optimized_collate_retriever(batch_samples):
+    """
+    高效的 collate_fn，將 list of samples 正確打包成一個批次。
+    - 對於可變長度的 tensor，使用 pad_sequence。
+    - 對於固定長度的 tensor，使用 stack。
+    """
+    # 提取各個欄位
+    q_embs = torch.stack([s['q_emb'] for s in batch_samples])
+    
+    # 不要對實體相關張量使用 pad_sequence，保持為 list
+    entity_embs_list = [s['entity_embs'] for s in batch_samples]
+    relation_embs_list = [s['relation_embs'] for s in batch_samples]
+    topic_entity_one_hots_list = [s['topic_entity_one_hot'] for s in batch_samples]
+    target_triple_probs_list = [s['target_triple_probs'] for s in batch_samples]
+    
+    # 處理 ID 列表
+    h_id_tensors = [torch.tensor(s['h_id_list']) for s in batch_samples]
+    r_id_tensors = [torch.tensor(s['r_id_list']) for s in batch_samples]
+    t_id_tensors = [torch.tensor(s['t_id_list']) for s in batch_samples]
+
+    # 其他非 tensor 資訊
+    a_entity_id_lists = [s['a_entity_id_list'] for s in batch_samples]
+    num_non_text_entities = [len(s['non_text_entity_list']) for s in batch_samples]
+
+    return {
+        'q_emb': q_embs,
+        'entity_embs_list': entity_embs_list,  # 改為 list
+        'relation_embs_list': relation_embs_list,  # 改為 list
+        'topic_entity_one_hot_list': topic_entity_one_hots_list,  # 改為 list
+        'target_triple_probs_list': target_triple_probs_list,  # 改為 list
+        'h_id_tensors': h_id_tensors,
+        'r_id_tensors': r_id_tensors,
+        't_id_tensors': t_id_tensors,
+        'a_entity_id_lists': a_entity_id_lists,
+        'num_non_text_entities': num_non_text_entities,
+    }
+    

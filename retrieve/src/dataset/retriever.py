@@ -4,6 +4,7 @@ import os
 import pickle
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from collections import defaultdict
 import gc
 import random
@@ -13,96 +14,200 @@ from tqdm import tqdm
 # =============================================================================
 # 原始類別 - 保留不變
 # =============================================================================
+"""
+模組層級輔助函數：圖操作與評分
+"""
+import networkx as nx
+import torch
+from collections import defaultdict
+
+def build_nx_g(h_id_list, r_id_list, t_id_list):
+    """建立標準 NetworkX 圖"""
+    nx_g = nx.DiGraph()
+    num_triples = len(h_id_list)
+    for i in range(num_triples):
+        h_i = h_id_list[i]
+        r_i = r_id_list[i]
+        t_i = t_id_list[i]
+        nx_g.add_edge(h_i, t_i, triple_id=i, relation_id=r_i)
+    return nx_g
+
+def build_nx_g_with_weights(h_id_list, r_id_list, t_id_list):
+    """建立帶頻率權重的 NetworkX 圖（出現越多，路徑代價越低）"""
+    nx_g = nx.DiGraph()
+    edge_counts = defaultdict(int)
+    for h, r, t in zip(h_id_list, r_id_list, t_id_list):
+        edge_counts[(h, r, t)] += 1
+    edge_weights = {}
+    for (h, r, t), count in edge_counts.items():
+        weight = 1.0 / (count + 1)
+        edge_weights[(h, r, t)] = weight
+    num_triples = len(h_id_list)
+    for i in range(num_triples):
+        h_i = h_id_list[i]
+        r_i = r_id_list[i]
+        t_i = t_id_list[i]
+        nx_g.add_edge(h_i, t_i, triple_id=i, relation_id=r_i, weight=edge_weights[(h_i, r_i, t_i)])
+    return nx_g
+
+def build_nx_g_with_inverse_weights(h_id_list, r_id_list, t_id_list):
+    """建立逆頻率權重的 NetworkX 圖（出現越多，路徑代價越高）"""
+    nx_g = nx.DiGraph()
+    edge_counts = defaultdict(int)
+    for h, r, t in zip(h_id_list, r_id_list, t_id_list):
+        edge_counts[(h, r, t)] += 1
+    edge_weights = {}
+    for (h, r, t), count in edge_counts.items():
+        # 出現次數作為代價，越常見越貴
+        weight = float(max(1, count))
+        edge_weights[(h, r, t)] = weight
+    num_triples = len(h_id_list)
+    for i in range(num_triples):
+        h_i = h_id_list[i]
+        r_i = r_id_list[i]
+        t_i = t_id_list[i]
+        nx_g.add_edge(h_i, t_i, triple_id=i, relation_id=r_i, weight=edge_weights[(h_i, r_i, t_i)])
+    return nx_g
+
+def find_shortest_paths(nx_g, q_entity_id, a_entity_id):
+    """找最短路徑（標準版）"""
+    try:
+        forward_paths = list(nx.all_shortest_paths(nx_g, q_entity_id, a_entity_id))
+    except Exception:
+        forward_paths = []
+    try:
+        backward_paths = list(nx.all_shortest_paths(nx_g, a_entity_id, q_entity_id))
+    except Exception:
+        backward_paths = []
+    full_paths = forward_paths + backward_paths
+    if (len(forward_paths) == 0) or (len(backward_paths) == 0):
+        return full_paths
+    min_path_len = min([len(path) for path in full_paths])
+    refined_paths = []
+    for path in full_paths:
+        if len(path) == min_path_len:
+            refined_paths.append(path)
+    return refined_paths
+
+def find_weighted_shortest_paths(nx_g, q_entity_id, a_entity_id):
+    """找加權最短路徑"""
+    try:
+        forward_paths = list(nx.all_shortest_paths(nx_g, q_entity_id, a_entity_id, weight='weight'))
+    except Exception:
+        forward_paths = []
+    try:
+        backward_paths = list(nx.all_shortest_paths(nx_g, a_entity_id, q_entity_id, weight='weight'))
+    except Exception:
+        backward_paths = []
+    full_paths = forward_paths + backward_paths
+    if (len(forward_paths) == 0) or (len(backward_paths) == 0):
+        return full_paths
+    weighted_paths = []
+    for path in full_paths:
+        weight_sum = 0
+        for i in range(len(path) - 1):
+            weight_sum += nx_g[path[i]][path[i+1]].get('weight', 1.0)
+        weighted_paths.append((path, weight_sum))
+    if not weighted_paths:
+        return []
+    min_weight = min([wp[1] for wp in weighted_paths])
+    refined_paths = [wp[0] for wp in weighted_paths if wp[1] == min_weight]
+    return refined_paths
+
+def score_triples(path_list, num_triples):
+    """標準 triple 評分"""
+    triple_scores = torch.zeros(num_triples)
+    for path in path_list:
+        for triple_id_list in path:
+            triple_scores[triple_id_list] = 1.
+    return triple_scores
+
+def score_triples_with_weights(path_list, num_triples, nx_g):
+    """加權 triple 評分（出現越多，加分越多）"""
+    triple_scores = torch.zeros(num_triples)
+    for path in path_list:
+        for triple_id_list in path:
+            for triple_id in triple_id_list:
+                triple_scores[triple_id] += 1.0
+    return triple_scores
+
+def score_triples_with_inverse_weights(path_list, num_triples, triple_id_to_count):
+    """逆頻率 triple 評分（出現越多，加分越少）"""
+    triple_scores = torch.zeros(num_triples)
+    for path in path_list:
+        for triple_id_list in path:
+            for triple_id in triple_id_list:
+                count = max(1, int(triple_id_to_count.get(triple_id, 1)))
+                triple_scores[triple_id] += 1.0 / float(count)
+    return triple_scores
 
 class LazyEmbeddingDict:
     """
-    懶加載的 embedding 字典，只在需要時載入數據
+    懶加載的 embedding 字典：
+    - 啟動時建立 sample_id -> batch_idx 的映射（一次掃描）
+    - 使用 LRU 緩存載入的批次，節省記憶體
+    - 提供 keys()/__contains__/__len__ 介面
     """
     def __init__(self, batch_dir, batch_files, cache_size=8):
         self.batch_dir = batch_dir
         self.batch_files = batch_files
-        self._cache = {}  # LRU 緩存
+        self._cache = {}
         self._cache_size = cache_size
-        self._cache_access_order = []  # LRU 順序
-        
-        # 創建樣本ID到批次文件的映射
+        self._cache_access_order = []
+        # 建立樣本映射
         self._sample_to_batch = {}
-        self._create_sample_mapping()
-    
-    def _create_sample_mapping(self):
-        """創建樣本ID到批次文件的映射"""
-        
+        self._build_sample_mapping()
+
+    def _build_sample_mapping(self):
+        total_samples = 0
         for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Mapping sample IDs", unit="batch")):
             batch_path = os.path.join(self.batch_dir, batch_file)
-            
             try:
-                # 載入批次文件來獲取樣本ID
                 batch_data = torch.load(batch_path, map_location='cpu')
-                
-                # 為每個樣本創建映射
                 for sample_id in batch_data.keys():
                     self._sample_to_batch[sample_id] = batch_idx
-                
-                # 立即清理
+                total_samples += len(batch_data)
+            except Exception as e:
+                tqdm.write(f"Error loading {batch_file}: {e}")
+            finally:
                 del batch_data
                 gc.collect()
-                
-            except Exception as e:
-                tqdm.write(f"Error loading {batch_file} for mapping: {e}")
-                continue
-        
-        print(f"Created mapping for {len(self._sample_to_batch)} samples")
-    
+        print(f"✅ Created mapping for {len(self._sample_to_batch)} samples from {len(self.batch_files)} batches (avg {total_samples / max(1, len(self.batch_files)):.1f}/batch)")
+
     def _load_batch_to_cache(self, batch_idx):
-        """載入批次到緩存"""
         if batch_idx in self._cache:
-            # 更新LRU順序
+            # 更新 LRU
             if batch_idx in self._cache_access_order:
                 self._cache_access_order.remove(batch_idx)
             self._cache_access_order.append(batch_idx)
             return self._cache[batch_idx]
-        
         batch_file = self.batch_files[batch_idx]
         batch_path = os.path.join(self.batch_dir, batch_file)
-        
-        try:
-            batch_data = torch.load(batch_path, map_location='cpu')
-            
-            # 更新緩存
-            if len(self._cache) >= self._cache_size:
-                # 移除最舊的緩存項
-                oldest_key = self._cache_access_order.pop(0)
-                del self._cache[oldest_key]
-            
-            self._cache[batch_idx] = batch_data
-            self._cache_access_order.append(batch_idx)
-            
-            return batch_data
-            
-        except Exception as e:
-            print(f"Error loading batch file {batch_file}: {e}")
-            raise KeyError(f"Failed to load embeddings for batch {batch_idx}")
-    
+        batch_data = torch.load(batch_path, map_location='cpu')
+        # LRU 驅逐
+        if len(self._cache) >= self._cache_size:
+            oldest = self._cache_access_order.pop(0)
+            if oldest in self._cache:
+                del self._cache[oldest]
+        self._cache[batch_idx] = batch_data
+        self._cache_access_order.append(batch_idx)
+        return batch_data
+
     def __getitem__(self, sample_id):
-        # 檢查樣本ID是否在映射中
         if sample_id not in self._sample_to_batch:
             raise KeyError(f"Sample ID {sample_id} not found in any batch")
-        
         batch_idx = self._sample_to_batch[sample_id]
         batch_data = self._load_batch_to_cache(batch_idx)
-        
-        # 直接返回樣本的 embeddings
-        if sample_id in batch_data:
-            return batch_data[sample_id]
-        else:
+        if sample_id not in batch_data:
             raise KeyError(f"Sample {sample_id} not found in batch {batch_idx}")
-    
+        return batch_data[sample_id]
+
     def __contains__(self, sample_id):
         return sample_id in self._sample_to_batch
-    
+
     def keys(self):
         return self._sample_to_batch.keys()
-    
+
     def __len__(self):
         return len(self._sample_to_batch)
 
@@ -116,7 +221,10 @@ class RetrieverDataset:
         config,
         split,
         skip_no_path=True,
-        freq_weight=False
+        freq_weight=False,
+        freq_weight_inv=False,
+        kge_freq_weight=False,
+        kge_scorer=None
     ):
         # Load pre-processed data.
         dataset_name = config['dataset']['name']
@@ -125,7 +233,7 @@ class RetrieverDataset:
         # Extract directed shortest paths from topic entities to answer
         # entities or vice versa as weak supervision signals for triple scoring.
         triple_score_dict = self._get_triple_scores(
-            dataset_name, split, processed_dict_list, freq_weight)
+            dataset_name, split, processed_dict_list, freq_weight, freq_weight_inv, kge_freq_weight, kge_scorer)
 
         # Load pre-computed embeddings.
         emb_dict = self._load_emb(
@@ -146,10 +254,17 @@ class RetrieverDataset:
         dataset_name,
         split,
         processed_dict_list,
-        freq_weight=False
+        freq_weight=False,
+        freq_weight_inv=False,
+        kge_freq_weight=False,
+        kge_scorer=None
     ):
         # 根據是否使用頻率權重選擇不同的保存目錄
-        if freq_weight:
+        if kge_freq_weight:
+            save_dir = os.path.join('data_files', dataset_name, 'triple_scores_kge_freq_weight')
+        elif freq_weight_inv:
+            save_dir = os.path.join('data_files', dataset_name, 'triple_scores_freq_weight_inv')
+        elif freq_weight:
             save_dir = os.path.join('data_files', dataset_name, 'triple_scores_freq_weight')
         else:
             save_dir = os.path.join('data_files', dataset_name, 'triple_scores')
@@ -165,7 +280,7 @@ class RetrieverDataset:
             sample_i = processed_dict_list[i]
             sample_i_id = sample_i['id']
             triple_scores_i, max_path_length_i = self._extract_paths_and_score(
-                sample_i, freq_weight)
+                sample_i, freq_weight, freq_weight_inv, kge_freq_weight, kge_scorer)
 
             triple_score_dict[sample_i_id] = {
                 'triple_scores': triple_scores_i,
@@ -175,8 +290,21 @@ class RetrieverDataset:
         torch.save(triple_score_dict, save_file)
         return triple_score_dict
 
-    def _extract_paths_and_score(self, sample, freq_weight=False):
-        if freq_weight:
+    def _extract_paths_and_score(self, sample, freq_weight=False, freq_weight_inv=False, kge_freq_weight=False, kge_scorer=None):
+        if kge_freq_weight:
+            nx_g = self._get_nx_g_with_kge_weights(
+                sample['h_id_list'],
+                sample['r_id_list'],
+                sample['t_id_list'],
+                kge_scorer
+            )
+        elif freq_weight_inv:
+            nx_g = self._get_nx_g_with_inverse_weights(
+                sample['h_id_list'],
+                sample['r_id_list'],
+                sample['t_id_list']
+            )
+        elif freq_weight:
             nx_g = self._get_nx_g_with_weights(
                 sample['h_id_list'],
                 sample['r_id_list'],
@@ -193,7 +321,7 @@ class RetrieverDataset:
         path_list_ = []
         for q_entity_id in sample['q_entity_id_list']:
             for a_entity_id in sample['a_entity_id_list']:
-                if freq_weight:
+                if freq_weight or freq_weight_inv or kge_freq_weight:
                     paths_q_a = self._weighted_shortest_path(nx_g, q_entity_id, a_entity_id)
                 else:
                     paths_q_a = self._shortest_path(nx_g, q_entity_id, a_entity_id)
@@ -222,7 +350,7 @@ class RetrieverDataset:
 
         # Create triple score dict.
         num_triples = len(sample['h_id_list'])
-        if freq_weight:
+        if freq_weight or freq_weight_inv:
             triple_scores = self._score_triples_with_weights(
                 path_list, num_triples, nx_g)
         else:
@@ -241,31 +369,28 @@ class RetrieverDataset:
         return nx_g
 
     def _get_nx_g_with_weights(self, h_id_list, r_id_list, t_id_list):
-        """建立帶頻率權重的 NetworkX 圖"""
+        """建立帶頻率權重的 NetworkX 圖（使用 relation 出現頻率作為權重）"""
         nx_g = nx.DiGraph()
         
-        # 計算每個 edge 的出現頻率
-        edge_counts = defaultdict(int)
-        for h, r, t in zip(h_id_list, r_id_list, t_id_list):
-            edge_counts[(h, r, t)] += 1
+        # 先計算每個 relation 的出現頻率
+        relation_counts = defaultdict(int)
+        for r in r_id_list:
+            relation_counts[r] += 1
         
-        # 計算權重：頻率越高，權重越低（路徑越短）
-        max_count = max(edge_counts.values()) if edge_counts else 1
-        edge_weights = {}
-        for (h, r, t), count in edge_counts.items():
-            weight = 1.0 / (count + 1)  # 避免除零
-            edge_weights[(h, r, t)] = weight
-        
+        # relation 出現越多，邊的代價越低（以 1/(count+1) 當作代價）
         num_triples = len(h_id_list)
         for i in range(num_triples):
             h_i = h_id_list[i]
             r_i = r_id_list[i]
             t_i = t_id_list[i]
-            
-            nx_g.add_edge(h_i, t_i, 
-                          triple_id=i, 
-                          relation_id=r_i,
-                          weight=edge_weights[(h_i, r_i, t_i)])
+            weight = 1.0 / float(relation_counts[r_i] + 1)
+            nx_g.add_edge(
+                h_i,
+                t_i,
+                triple_id=i,
+                relation_id=r_i,
+                weight=weight
+            )
         
         return nx_g
 
@@ -428,6 +553,68 @@ class RetrieverDataset:
     
     def __getitem__(self, i):
         return self.processed_dict_list[i]
+
+    def _get_nx_g_with_kge_weights(self, h_id_list, r_id_list, t_id_list, kge_scorer):
+        """建立帶 KGE 權重的 NetworkX 圖"""
+        nx_g = nx.DiGraph()
+        
+        if kge_scorer is None:
+            # 如果沒有 KGE scorer，回退到標準圖
+            return self._get_nx_g(h_id_list, r_id_list, t_id_list)
+        
+        # 計算每個 triple 的 KGE 權重
+        num_triples = len(h_id_list)
+        for i in range(num_triples):
+            h_i = h_id_list[i]
+            r_i = r_id_list[i]
+            t_i = t_id_list[i]
+            
+            # 計算這個 triple 的 KGE 權重
+            kge_weights = kge_scorer.compute_triple_weights(
+                torch.tensor([h_i]), torch.tensor([r_i]), torch.tensor([t_i])
+            )
+            kge_weight = kge_weights[0].item()
+            
+            # 將 KGE 權重轉換為邊權重（KGE 分數越高，邊權重越低）
+            # 使用 1 / (kge_weight + epsilon) 來避免除零
+            epsilon = 1e-6
+            edge_weight = 1.0 / (kge_weight + epsilon)
+            
+            nx_g.add_edge(
+                h_i,
+                t_i,
+                triple_id=i,
+                relation_id=r_i,
+                weight=edge_weight
+            )
+        
+        return nx_g
+
+    def _get_nx_g_with_inverse_weights(self, h_id_list, r_id_list, t_id_list):
+        """建立逆頻率權重的 NetworkX 圖（使用 relation 出現頻率作為代價，越常見越高）"""
+        nx_g = nx.DiGraph()
+        
+        # 計算每個 relation 的出現頻率
+        relation_counts = defaultdict(int)
+        for r in r_id_list:
+            relation_counts[r] += 1
+        
+        # relation 出現越多，邊的代價越高（以 count 或 count+1 當作代價）
+        num_triples = len(h_id_list)
+        for i in range(num_triples):
+            h_i = h_id_list[i]
+            r_i = r_id_list[i]
+            t_i = t_id_list[i]
+            weight = float(relation_counts[r_i] + 1)
+            nx_g.add_edge(
+                h_i,
+                t_i,
+                triple_id=i,
+                relation_id=r_i,
+                weight=weight
+            )
+        
+        return nx_g
 
 # =============================================================================
 # 原始 collate_retriever - 保留不變
@@ -915,174 +1102,6 @@ class SmartBatchRetrieverDataset:
         
         return sample
 
-# 導入 LazyEmbeddingDict (已在文件頂部定義)
-
-class OptimizedRetrieverDataset:
-    """
-    真正的小批次載入 Dataset，避免在初始化時載入所有嵌入
-    保持與 RetrieverDataset 相同的行為，包括 DataLoader shuffle
-    """
-    def __init__(
-        self,
-        config,
-        split,
-        skip_no_path=True,
-        freq_weight=False,
-        samples_per_epoch: int | None = None,
-        samples_per_batch_load: int | None = None,
-        cache_size=8
-    ):
-        self.config = config
-        self.split = split
-        self.skip_no_path = skip_no_path
-        self.freq_weight = freq_weight
-        self.samples_per_epoch = samples_per_epoch
-        self.samples_per_batch_load = samples_per_batch_load
-        self.cache_size = cache_size
-        
-        dataset_name = config['dataset']['name']
-        
-        # 載入輕量級資料（不包含嵌入）
-        self.processed_dict_list = self._load_processed(dataset_name, split)
-        self.triple_score_dict = self._get_triple_scores(
-            dataset_name, split, self.processed_dict_list, freq_weight)
-        
-        # 智能嵌入載入策略
-        self.emb_dict = self._smart_load_embeddings(
-            dataset_name, config['dataset']['text_encoder_name'], split)
-        
-        # 過濾有效樣本（不載入嵌入）
-        self.valid_sample_ids = self._filter_valid_samples()
-        
-        # 計算統計資訊
-        self._compute_statistics()
-        
-        print(f"✅ OptimizedRetrieverDataset initialized with {len(self.valid_sample_ids)} valid samples")
-        print(f"📊 Memory-efficient loading: embeddings loaded on-demand")
-    
-    def _load_processed(self, dataset_name, split):
-        """載入處理過的資料"""
-        processed_file = os.path.join(f'data_files/{dataset_name}/processed/{split}.pkl')
-        with open(processed_file, 'rb') as f:
-            return pickle.load(f)
-    
-    def _get_triple_scores(self, dataset_name, split, processed_dict_list, freq_weight=False):
-        """載入 triple scores"""
-        if freq_weight:
-            save_dir = os.path.join('data_files', dataset_name, 'triple_scores_freq_weight')
-        else:
-            save_dir = os.path.join('data_files', dataset_name, 'triple_scores')
-        
-        save_file = os.path.join(save_dir, f'{split}.pth')
-        if os.path.exists(save_file):
-            return torch.load(save_file)
-        
-        raise FileNotFoundError(f"Triple scores not found: {save_file}")
-    
-    def _smart_load_embeddings(self, dataset_name, text_encoder_name, split):
-        """智能載入策略：自動檢測最佳載入方式"""
-        # 1. 檢查是否有合併檔案
-        merged_file = f'data_files/{dataset_name}/emb/{text_encoder_name}/{split}.pth'
-        if os.path.exists(merged_file):
-            print(f"✅ Found merged file, using full loading: {merged_file}")
-            return torch.load(merged_file)
-        
-        # 2. 檢查批次檔案
-        batch_dir = f'data_files/{dataset_name}/emb/{text_encoder_name}'
-        if os.path.exists(batch_dir):
-            batch_files = [f for f in os.listdir(batch_dir) 
-                          if f.startswith(f'{split}_batch_') and f.endswith('.pth')]
-            if batch_files:
-                print(f"✅ Found {len(batch_files)} batch files, using lazy loading")
-                return LazyEmbeddingDict(batch_dir, batch_files, cache_size=self.cache_size)
-        
-        raise FileNotFoundError(f"No embeddings found for {dataset_name}/{text_encoder_name}/{split}")
-    
-    def _filter_valid_samples(self):
-        """過濾有效樣本（不載入嵌入）"""
-        valid_ids = []
-        for sample in self.processed_dict_list:
-            sample_id = sample['id']
-            
-            # 檢查嵌入是否存在
-            if sample_id not in self.emb_dict:
-                continue
-            
-            # 檢查路徑是否有效
-            if sample_id not in self.triple_score_dict:
-                continue
-                
-            max_path_length = self.triple_score_dict[sample_id]['max_path_length']
-            if self.skip_no_path and (max_path_length in [None, 0]):
-                continue
-            
-            valid_ids.append(sample_id)
-        
-        return valid_ids
-    
-    def _compute_statistics(self):
-        """計算統計資訊"""
-        num_relevant_triples = []
-        for sample_id in self.valid_sample_ids:
-            triple_score = self.triple_score_dict[sample_id]['triple_scores']
-            num_relevant_triples_i = len(triple_score.nonzero())
-            num_relevant_triples.append(num_relevant_triples_i)
-        
-        if num_relevant_triples:
-            self.median_num_relevant = int(np.median(num_relevant_triples))
-            self.mean_num_relevant = int(np.mean(num_relevant_triples))
-            self.max_num_relevant = int(np.max(num_relevant_triples))
-        else:
-            self.median_num_relevant = 0
-            self.mean_num_relevant = 0
-            self.max_num_relevant = 0
-        
-        self.num_skipped = len(self.processed_dict_list) - len(self.valid_sample_ids)
-        
-        print(f'# skipped samples: {self.num_skipped}')
-        print(f'# relevant triples | median: {self.median_num_relevant} | mean: {self.mean_num_relevant} | max: {self.max_num_relevant}')
-    
-    def __len__(self):
-        """返回有效樣本數量"""
-        return len(self.valid_sample_ids)
-    
-    def __getitem__(self, idx):
-        """按索引存取樣本，支援 DataLoader shuffle"""
-        sample_id = self.valid_sample_ids[idx]
-        
-        # 找到對應的 processed sample
-        sample = None
-        for s in self.processed_dict_list:
-            if s['id'] == sample_id:
-                sample = s.copy()
-                break
-        
-        if sample is None:
-            raise KeyError(f"Sample {sample_id} not found")
-        
-        # 添加 triple scores
-        triple_score_info = self.triple_score_dict[sample_id]
-        sample['target_triple_probs'] = triple_score_info['triple_scores']
-        sample['max_path_length'] = triple_score_info['max_path_length']
-        
-        # 懶加載嵌入資料（只在需要時載入）
-        sample_emb_data = self.emb_dict[sample_id]
-        sample.update(sample_emb_data)
-        
-        # 清理和格式化
-        sample['a_entity'] = list(set(sample['a_entity']))
-        sample['a_entity_id_list'] = list(set(sample['a_entity_id_list']))
-        
-        # PE for topic entities
-        num_entities = len(sample['text_entity_list']) + len(sample['non_text_entity_list'])
-        topic_entity_mask = torch.zeros(num_entities)
-        topic_entity_mask[sample['q_entity_id_list']] = 1.
-        topic_entity_one_hot = F.one_hot(topic_entity_mask.long(), num_classes=2)
-        sample['topic_entity_one_hot'] = topic_entity_one_hot.float()
-        
-        return sample
-
-
 # =============================================================================
 # 優化的 collate 函數
 # =============================================================================
@@ -1561,3 +1580,448 @@ class ImprovedRandomBatchRetrieverDataset:
         
         return prepared_samples
 
+# =============================================================================
+# latest issue
+# =============================================================================
+
+class OptimizedRetrieverDataset:
+    """
+    真正符合 PyTorch 設計理念的優化版 Dataset。
+    - __init__: 只做最輕量級的初始化 (讀取 metadata)。
+    - __getitem__: 負責載入並準備一個完整的樣本。
+    將批次處理、Shuffle、多線程預取等工作完全交給 DataLoader。
+    """
+    def __init__(self, config, split, skip_no_path=True, freq_weight=False, weight_mode='none'):
+        # --- 初始化階段：只載入輕量級 metadata ---
+        print(f"Initializing {split} set (lightweight)...")
+        self.config = config
+        self.split = split
+        self.skip_no_path = skip_no_path
+        # 兼容舊參數：若 weight_mode 未指定，根據 freq_weight 推導
+        if weight_mode == 'none' and freq_weight:
+            weight_mode = 'freq'
+        self.weight_mode = weight_mode  # 'none' | 'freq' | 'inv' | 'spcount' | 'spcount_inv'
+        self.freq_weight = (self.weight_mode == 'freq')
+        dataset_name = config['dataset']['name']
+
+        # 1. 載入 processed data (通常是 .pkl，很快)
+        processed_file = os.path.join(f'data_files/{dataset_name}/processed/{split}.pkl')
+        with open(processed_file, 'rb') as f:
+            self.processed_dict_list = pickle.load(f)
+
+        # 建立即時查找的 processed_map，並做可前置的預處理（去重與 one_hot）
+        self.processed_map = {}
+        for s in self.processed_dict_list:
+            sample = s.copy()
+            # 去重答案實體
+            if 'a_entity_id_list' in sample:
+                sample['a_entity_id_list'] = list(set(sample['a_entity_id_list']))
+            # 預先計算 topic_entity_one_hot（不依賴 embeddings）
+            if 'text_entity_list' in sample and 'non_text_entity_list' in sample and 'q_entity_id_list' in sample:
+                num_entities = len(sample['text_entity_list']) + len(sample['non_text_entity_list'])
+                topic_entity_mask = torch.zeros(num_entities)
+                if sample['q_entity_id_list']:
+                    topic_entity_mask[sample['q_entity_id_list']] = 1.
+                sample['topic_entity_one_hot'] = F.one_hot(topic_entity_mask.long(), num_classes=2).float()
+            self.processed_map[s['id']] = sample
+
+        # 2. 載入 triple scores (通常是 .pth，很快)
+        self.triple_score_dict = self._load_triple_scores(dataset_name, split, self.weight_mode)
+
+        # 3. 懶加載 Embeddings (只建立 LazyEmbeddingDict 對象，不讀取數據)
+        self.emb_dict = self._setup_lazy_embeddings(dataset_name, config['dataset']['text_encoder_name'], split)
+        
+        # 4. 過濾出有效的樣本 ID 列表
+        # 這個列表的順序將是 DataLoader 索引的依據
+        self.valid_sample_ids = self._filter_valid_samples()
+        
+        # 5. 【新增】計算並儲存統計數據
+        self._compute_statistics()
+        
+        print(f"✅ Initialized {split} set with {len(self.valid_sample_ids)} valid samples.")
+        print(f"   - Skipped samples: {self.num_skipped}")
+        print(f"   - Relevant triples (median): {self.median_num_relevant}")
+        print(f"   Embeddings will be loaded on-demand by DataLoader workers.")
+
+    def __len__(self):
+        """返回有效樣本的總數"""
+        return len(self.valid_sample_ids)
+
+    def __getitem__(self, idx):
+        """
+        DataLoader 的核心！根據索引 idx 獲取單一完整樣本。
+        這個函數會被多個 worker 並行調用。
+        """
+        # 1. 從有效 ID 列表中獲取 sample_id
+        sample_id = self.valid_sample_ids[idx]
+
+        # 2. 快速取得預處理後的 metadata（拷貝以保留不可變性）
+        sample = self.processed_map[sample_id].copy()
+
+        # 3. 添加 triple scores (從記憶體中，很快)
+        triple_score_info = self.triple_score_dict[sample_id]
+        sample['target_triple_probs'] = triple_score_info['triple_scores']
+        
+        # 4. **執行 I/O 操作**: 使用 LazyEmbeddingDict 懶加載此樣本的 embedding
+        sample_emb_data = self.emb_dict[sample_id]
+        sample.update(sample_emb_data)
+
+        return sample
+
+    # --- 以下是輔助函數 ---
+
+    def _load_triple_scores(self, dataset_name, split, weight_mode):
+        save_dir_map = {
+            'none': 'triple_scores',
+            'freq': 'triple_scores_freq_weight',
+            'inv': 'triple_scores_inv_freq_weight',
+            'spcount': 'triple_scores_spcount',
+            'spcount_inv': 'triple_scores_spcount_inv'
+        }
+        save_dir = os.path.join('data_files', dataset_name, save_dir_map.get(weight_mode, 'triple_scores'))
+        os.makedirs(save_dir, exist_ok=True)
+        save_file = os.path.join(save_dir, f'{split}.pth')
+        if os.path.exists(save_file):
+            return torch.load(save_file)
+        # 檔案不存在時，現場計算並儲存（避免因缺檔而中止）
+        print(f"⚠️ Triple scores not found. Computing on-the-fly: {save_file}")
+        triple_score_dict = {}
+        for sample in tqdm(self.processed_dict_list, desc=f"Computing triple scores ({weight_mode})"):
+            sample_id = sample['id']
+            h_list = sample['h_id_list']
+            r_list = sample['r_id_list']
+            t_list = sample['t_id_list']
+            # 選擇圖構建
+            if weight_mode == 'freq':
+                nx_g = build_nx_g_with_weights(h_list, r_list, t_list)
+            elif weight_mode == 'inv':
+                nx_g = build_nx_g_with_inverse_weights(h_list, r_list, t_list)
+            else:
+                nx_g = self._get_nx_g(h_list, r_list, t_list)
+            
+            # 蒐集最短路徑（spcount 模式下總是用未加權最短路徑）
+            path_list_ = []
+            for q_entity_id in sample['q_entity_id_list']:
+                for a_entity_id in sample['a_entity_id_list']:
+                    if weight_mode in ['freq', 'inv']:
+                        paths_q_a = self._weighted_shortest_path(nx_g, q_entity_id, a_entity_id)
+                    else:
+                        paths_q_a = self._shortest_path(nx_g, q_entity_id, a_entity_id)
+                    if len(paths_q_a) > 0:
+                        path_list_.extend(paths_q_a)
+            # 轉為 triple 路徑並計分
+            if len(path_list_) == 0:
+                max_path_length = None
+            else:
+                max_path_length = 0
+            path_list = []
+            for path in path_list_:
+                num_triples_path = len(path) - 1
+                max_path_length = max(max_path_length, num_triples_path)
+                triples_path = []
+                for i in range(num_triples_path):
+                    h_i = path[i]
+                    t_i = path[i+1]
+                    triple_id_i_list = [nx_g[h_i][t_i]['triple_id']]
+                    triples_path.append(triple_id_i_list)
+                path_list.append(triples_path)
+            num_triples = len(h_list)
+
+            # 依不同模式產生目標與正樣本權重因子
+            if weight_mode == 'freq':
+                triple_scores = self._score_triples_with_weights(path_list, num_triples, nx_g)
+                pos_weight_factors = torch.ones(num_triples)
+            elif weight_mode == 'inv':
+                # 需要 triple_id -> count
+                edge_counts = defaultdict(int)
+                for h, r, t in zip(h_list, r_list, t_list):
+                    edge_counts[(h, r, t)] += 1
+                triple_id_to_count = {i: edge_counts[(h, r, t)] for i, (h, r, t) in enumerate(zip(h_list, r_list, t_list))}
+                triple_scores = score_triples_with_inverse_weights(path_list, num_triples, triple_id_to_count)
+                pos_weight_factors = torch.ones(num_triples)
+            elif weight_mode in ['spcount', 'spcount_inv']:
+                # 統計每個 triple 出現在多少條最短路徑中（未加權 graph）
+                triple_counts = torch.zeros(num_triples)
+                for path in path_list:
+                    for triple_id_list in path:
+                        for triple_id in triple_id_list:
+                            triple_counts[triple_id] += 1
+                # 目標為是否在任一最短路徑上
+                triple_scores = (triple_counts > 0).float()
+                # 正樣本權重因子：spcount -> 次數；spcount_inv -> 1/次數
+                pos_weight_factors = torch.ones(num_triples)
+                positive_idx = triple_counts > 0
+                if weight_mode == 'spcount':
+                    pos_weight_factors[positive_idx] = triple_counts[positive_idx]
+                else:
+                    pos_weight_factors[positive_idx] = 1.0 / triple_counts[positive_idx]
+            else:
+                triple_scores = self._score_triples(path_list, num_triples)
+                pos_weight_factors = torch.ones(num_triples)
+
+            triple_score_dict[sample_id] = {
+                'triple_scores': triple_scores,
+                'pos_weight_factors': pos_weight_factors,
+                'max_path_length': max_path_length
+            }
+        torch.save(triple_score_dict, save_file)
+        print(f"✅ Saved computed triple scores to {save_file}")
+        return triple_score_dict
+
+    def _setup_lazy_embeddings(self, dataset_name, text_encoder_name, split):
+        # 先嘗試合併檔（webqsp 等小數據集）
+        merged_file = f'data_files/{dataset_name}/emb/{text_encoder_name}/{split}.pth'
+        if os.path.exists(merged_file):
+            print(f"✅ Found merged embedding file: {merged_file}")
+            return torch.load(merged_file, map_location='cpu')
+        
+        # 否則使用分批檔（cwq 等大數據集）
+        batch_dir = f'data_files/{dataset_name}/emb/{text_encoder_name}'
+        batch_files = sorted([f for f in os.listdir(batch_dir)
+                              if f.startswith(f'{split}_batch_') and f.endswith('.pth')],
+                             key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        if not batch_files:
+            raise FileNotFoundError(f"No embeddings found for split {split}: neither merged file nor batch files present in {batch_dir}")
+        
+        # 建議 cache_size 與 num_workers 數量相關，預設較小以避免多 worker 累積占用
+        cfg_cache = None
+        try:
+            cfg_cache = int(self.config.get('dataset', {}).get('emb_cache_size', 0))
+        except Exception:
+            cfg_cache = None
+        env_cache = os.environ.get('EMB_CACHE_SIZE')
+        cache_size = 4  # 預設 4，避免多進程下佔用過大
+        if cfg_cache and cfg_cache > 0:
+            cache_size = cfg_cache
+        if env_cache and env_cache.isdigit() and int(env_cache) > 0:
+            cache_size = int(env_cache)
+        print(f"🔧 LazyEmbeddingDict cache_size={cache_size}")
+        return LazyEmbeddingDict(batch_dir, batch_files, cache_size=cache_size)
+
+    def _filter_valid_samples(self):
+        """過濾出在所有資料源中都存在的樣本ID"""
+        valid_ids = []
+        processed_ids = {s['id'] for s in self.processed_dict_list}
+
+        for sample_id in tqdm(self.emb_dict.keys(), desc="Filtering valid samples"):
+            if sample_id not in processed_ids:
+                continue
+            if sample_id not in self.triple_score_dict:
+                continue
+            
+            # skip_no_path 邏輯
+            max_path_length = self.triple_score_dict[sample_id].get('max_path_length')
+            if self.skip_no_path and (max_path_length is None or max_path_length == 0):
+                continue
+            
+            valid_ids.append(sample_id)
+        return valid_ids
+    
+    def _compute_statistics(self):
+        """
+        在初始化結束時計算一次統計數據。
+        """
+        print("📊 Computing statistics for the dataset...")
+        
+        # 1. 計算跳過的樣本數
+        total_processed = len(self.processed_dict_list)
+        valid_samples = len(self.valid_sample_ids)
+        self.num_skipped = total_processed - valid_samples
+
+        # 2. 計算相關 triple 的統計
+        num_relevant_triples = []
+        if not self.valid_sample_ids:
+            # 如果沒有有效樣本，設定預設值
+            self.median_num_relevant = 0
+            self.mean_num_relevant = 0
+            self.max_num_relevant = 0
+            return
+
+        for sample_id in self.valid_sample_ids:
+            # 確保 triple_score_dict 中有這個 key
+            if sample_id in self.triple_score_dict:
+                triple_score = self.triple_score_dict[sample_id]['triple_scores']
+                num_relevant_triples.append(len(triple_score.nonzero()))
+        
+        if num_relevant_triples:
+            self.median_num_relevant = int(np.median(num_relevant_triples))
+            self.mean_num_relevant = int(np.mean(num_relevant_triples))
+            self.max_num_relevant = int(np.max(num_relevant_triples))
+        else:
+            self.median_num_relevant = 0
+            self.mean_num_relevant = 0
+            self.max_num_relevant = 0
+    
+
+    def _get_nx_g(self, h_id_list, r_id_list, t_id_list):
+        """建立標準 NetworkX 圖"""
+        nx_g = nx.DiGraph()
+        num_triples = len(h_id_list)
+        for i in range(num_triples):
+            h_i = h_id_list[i]
+            r_i = r_id_list[i]
+            t_i = t_id_list[i]
+            nx_g.add_edge(h_i, t_i, triple_id=i, relation_id=r_i)
+        return nx_g
+
+    def _shortest_path(self, nx_g, q_entity_id, a_entity_id):
+        """找最短路徑（標準版）"""
+        try:
+            forward_paths = list(nx.all_shortest_paths(nx_g, q_entity_id, a_entity_id))
+        except Exception:
+            forward_paths = []
+        try:
+            backward_paths = list(nx.all_shortest_paths(nx_g, a_entity_id, q_entity_id))
+        except Exception:
+            backward_paths = []
+        full_paths = forward_paths + backward_paths
+        if (len(forward_paths) == 0) or (len(backward_paths) == 0):
+            return full_paths
+        min_path_len = min([len(path) for path in full_paths])
+        refined_paths = []
+        for path in full_paths:
+            if len(path) == min_path_len:
+                refined_paths.append(path)
+        return refined_paths
+
+    def _weighted_shortest_path(self, nx_g, q_entity_id, a_entity_id):
+        """找加權最短路徑"""
+        try:
+            forward_paths = list(nx.all_shortest_paths(nx_g, q_entity_id, a_entity_id, weight='weight'))
+        except Exception:
+            forward_paths = []
+        try:
+            backward_paths = list(nx.all_shortest_paths(nx_g, a_entity_id, q_entity_id, weight='weight'))
+        except Exception:
+            backward_paths = []
+        full_paths = forward_paths + backward_paths
+        if (len(forward_paths) == 0) or (len(backward_paths) == 0):
+            return full_paths
+        weighted_paths = []
+        for path in full_paths:
+            weight_sum = 0
+            for i in range(len(path) - 1):
+                weight_sum += nx_g[path[i]][path[i+1]].get('weight', 1.0)
+            weighted_paths.append((path, weight_sum))
+        if not weighted_paths:
+            return []
+        min_weight = min([wp[1] for wp in weighted_paths])
+        refined_paths = [wp[0] for wp in weighted_paths if wp[1] == min_weight]
+        return refined_paths
+
+    def _score_triples(self, path_list, num_triples):
+        """標準 triple 評分"""
+        triple_scores = torch.zeros(num_triples)
+        for path in path_list:
+            for triple_id_list in path:
+                triple_scores[triple_id_list] = 1.
+        return triple_scores
+
+    def _score_triples_with_weights(self, path_list, num_triples, nx_g):
+        """加權 triple 評分"""
+        triple_scores = torch.zeros(num_triples)
+        for path in path_list:
+            for triple_id_list in path:
+                for triple_id in triple_id_list:
+                    triple_scores[triple_id] += 1.0
+        return triple_scores
+
+def optimized_collate_retriever(batch_samples):
+    """
+    高效的 collate_fn，將 list of samples 正確打包成一個批次。
+    - 對於可變長度的 tensor，使用 pad_sequence。
+    - 對於固定長度的 tensor，使用 stack。
+    """
+    # 提取各個欄位
+    q_embs = torch.stack([s['q_emb'] for s in batch_samples])
+    
+    # 不要對實體相關張量使用 pad_sequence，保持為 list
+    entity_embs_list = [s['entity_embs'] for s in batch_samples]
+    relation_embs_list = [s['relation_embs'] for s in batch_samples]
+    topic_entity_one_hots_list = [s['topic_entity_one_hot'] for s in batch_samples]
+    target_triple_probs_list = [s['target_triple_probs'] for s in batch_samples]
+    
+    # 處理 ID 列表
+    h_id_tensors = [torch.tensor(s['h_id_list']) for s in batch_samples]
+    r_id_tensors = [torch.tensor(s['r_id_list']) for s in batch_samples]
+    t_id_tensors = [torch.tensor(s['t_id_list']) for s in batch_samples]
+
+    # 其他非 tensor 資訊
+    a_entity_id_lists = [s['a_entity_id_list'] for s in batch_samples]
+    num_non_text_entities = [len(s['non_text_entity_list']) for s in batch_samples]
+
+    return {
+        'q_emb': q_embs,
+        'entity_embs_list': entity_embs_list,  # 改為 list
+        'relation_embs_list': relation_embs_list,  # 改為 list
+        'topic_entity_one_hot_list': topic_entity_one_hots_list,  # 改為 list
+        'target_triple_probs_list': target_triple_probs_list,  # 改為 list
+        'h_id_tensors': h_id_tensors,
+        'r_id_tensors': r_id_tensors,
+        't_id_tensors': t_id_tensors,
+        'a_entity_id_lists': a_entity_id_lists,
+        'num_non_text_entities': num_non_text_entities,
+    }
+
+# =============================================================================
+# 分組取樣器：按檔案分桶以提高 I/O 局部性
+# =============================================================================
+
+class GroupedByFileBatchSampler:
+    """
+    將同一 embedding 檔案中的樣本盡量分配到同一個 batch，提升 I/O 快取命中。
+    - 若 dataset.emb_dict 具有 `_sample_to_batch`（LazyEmbeddingDict），則依據該映射分桶。
+    - 否則所有樣本視為同一桶，退化為一般打散後組 batch。
+    """
+    def __init__(self, dataset, batch_size: int, shuffle: bool = True, drop_last: bool = False):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+
+        # 準備索引與分桶
+        self.indices = list(range(len(dataset)))
+        # 建立 sample_id -> batch_idx 的映射（若可用）
+        self._sample_to_batch = getattr(getattr(dataset, 'emb_dict', None), '_sample_to_batch', None)
+
+        # 預先建立桶: bucket_id -> [dataset_index]
+        self._buckets = self._build_buckets()
+
+    def _build_buckets(self):
+        buckets = defaultdict(list)
+        if self._sample_to_batch is None:
+            # 單一桶退化情況
+            buckets[0] = self.indices
+            return buckets
+        # 根據 sample_id -> batch_idx 分桶
+        for ds_idx in self.indices:
+            sample_id = self.dataset.valid_sample_ids[ds_idx]
+            bucket_id = self._sample_to_batch.get(sample_id, -1)
+            buckets[bucket_id].append(ds_idx)
+        return buckets
+
+    def __iter__(self):
+        # 取得桶列表
+        bucket_items = list(self._buckets.items())
+        if self.shuffle:
+            random.shuffle(bucket_items)
+        # 逐桶產生 batch
+        for _, idx_list in bucket_items:
+            if self.shuffle:
+                random.shuffle(idx_list)
+            # 依序切分 batch
+            for start in range(0, len(idx_list), self.batch_size):
+                end = start + self.batch_size
+                if end > len(idx_list) and self.drop_last:
+                    break
+                yield idx_list[start:end]
+
+    def __len__(self):
+        # 估算 batch 數量
+        num_batches = 0
+        for _, idx_list in self._buckets.items():
+            if self.drop_last:
+                num_batches += len(idx_list) // self.batch_size
+            else:
+                num_batches += (len(idx_list) + self.batch_size - 1) // self.batch_size
+        return num_batches

@@ -13,12 +13,12 @@ def get_dynamic_batch_size() -> int:
     if torch.cuda.is_available():
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         if gpu_memory_gb < 8:
-            return 32
+            return 16
         elif gpu_memory_gb < 16:
-            return 64
+            return 32
         else:
-            return 128
-    return 32
+            return 64
+    return 16
 
 
 def collate_fn_basic(batch):

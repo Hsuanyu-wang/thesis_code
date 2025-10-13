@@ -7,7 +7,7 @@ from functools import partial
 from prompts import icl_user_prompt, icl_ass_prompt
 
 
-def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192, max_tokens=4000, seed=0, temperature=0, frequency_penalty=0):
+def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192 * 2, max_tokens=4000, seed=0, temperature=0, frequency_penalty=0):
     # Only allow local models, block paid APIs
     if "gpt" in model_name:
         print("[WARNING] Paid API models (like OpenAI GPT) are disabled on this system. Using a small local model instead.")
@@ -19,7 +19,7 @@ def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192, ma
         tensor_parallel_size=tensor_parallel_size, 
         max_seq_len_to_capture=max_seq_len_to_capture,
         gpu_memory_utilization=0.8,  # 設置 GPU 內存利用率為 80%
-        max_model_len=8192  # 限制最大模型長度
+        max_model_len=8192*2  # 限制最大模型長度
     )
     sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens,
                                      frequency_penalty=frequency_penalty)

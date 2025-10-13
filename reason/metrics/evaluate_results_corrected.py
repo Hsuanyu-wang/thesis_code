@@ -111,7 +111,7 @@ def eval_f1(precision, recall):
     return 2 * precision * recall / (precision + recall)
 
 
-def eval_hit(prediction, answer, double_check):
+def eval_hit1(prediction, answer, double_check):
     if len(prediction) == 0:
         return 0
     for a in answer:
@@ -222,7 +222,7 @@ def eval_hal_score(prediction, answer, double_check, good_sample, no_ans, subgra
             return score / len(prediction), stats
 
 
-def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_samples=False, eval_hops=-1):
+def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_samples=False, eval_hops=-1, reverse_order=False):
     # only one of subset and bad_samples can be True
     assert not (subset and bad_samples)
 
@@ -237,7 +237,7 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
     detailed_eval_file = predict_file.replace('predictions.jsonl', eval_name)
     # Load results
     acc_list = []
-    hit_list = []
+    hit1_list = []
     f1_list = []
     precision_list = []
     recall_list = []
@@ -246,14 +246,33 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
     total_match = 0
     hal_score_list = []
 
+    # Determine dataset name from prediction file path and locate the matching retrieval_result.pth
     if "webqsp" in predict_file:
-        samples_to_eval_path = "./scored_triples/webqsp_240912_unidir_test.pth"
         dataset_name = "webqsp"
     elif "cwq" in predict_file:
-        samples_to_eval_path = "./scored_triples/cwq_240907_unidir_test.pth"
         dataset_name = "cwq"
     else:
         raise NotImplementedError
+
+    # Find retrieval_result.pth by matching the experiment folder name
+    from pathlib import Path
+    exp_folder_name = Path(predict_file).parent.name
+    base_dir = f"/home/YX_thesis/retrieve/results/training/{dataset_name}"
+
+    pattern_exact = os.path.join(base_dir, "**", exp_folder_name, "retrieval_result.pth")
+    candidates = glob.glob(pattern_exact, recursive=True)
+    print("samples_to_eval_path:\n", candidates)
+    # if not candidates:
+    #     pattern_all = os.path.join(base_dir, "**", "retrieval_result.pth")
+    #     all_paths = glob.glob(pattern_all, recursive=True)
+    #     candidates = [p for p in all_paths if Path(p).parent.name == exp_folder_name]
+    if not candidates:
+        raise FileNotFoundError(
+            f"Could not find retrieval_result.pth for experiment '{exp_folder_name}' under {base_dir}."
+        )
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    samples_to_eval_path = candidates[0]
+    
     pred_file_path = f"./results/KGQA/{dataset_name}/RoG/test/results_gen_rule_path_RoG-{dataset_name}_RoG_test_predictions_3_False_jsonl/predictions.jsonl"
     prompt_mode = predict_file.split('/')[-1].split('-')[0]
     triplets = get_data(dataset_name, pred_file_path, samples_to_eval_path, 'test', prompt_mode)
@@ -265,7 +284,12 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
             triplets_dict[each['id']] = each['good_triplets_rog']
         else:
             input_triplets = [(triplet[0], triplet[1], triplet[2]) for triplet in each['scored_triplets']]
-            triplets_dict[each['id']] = unique_preserve_order(input_triplets)[:int(prompt_mode.split('_')[-1])]
+            ####################################################################################################
+            processed_triplets = unique_preserve_order(input_triplets)[:int(prompt_mode.split('_')[-1])]
+            if reverse_order:
+                processed_triplets = processed_triplets[::-1]  # 顛倒順序
+            triplets_dict[each['id']] = processed_triplets
+            #####################################################################################################
 
     samples_to_eval = torch.load(samples_to_eval_path, weights_only=False)
 
@@ -328,9 +352,10 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
                 precision_score, matched_1, num_pred = eval_precision(prediction, answer, double_check)
                 recall_score, matched_2, num_answer = eval_recall(prediction, answer, double_check)
                 f1_score = eval_f1(precision_score, recall_score)
-                hit = eval_hit(prediction, answer, double_check)
+                hit1 = eval_hit1(prediction, answer, double_check)
 
-                if not subset and not bad_samples:
+                # if not subset and not bad_samples:
+                if not bad_samples:
                     subgraph_ent = get_all_retrieved_entities(triplets_dict[id])
                     hal_score, stats = eval_hal_score(prediction, answer, double_check, samples_to_eval[id]['a_entity_in_graph'], no_ans_flag, subgraph_ent, stats)
                 else:
@@ -346,17 +371,17 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
                 f1_list.append(f1_score)
                 precision_list.append(precision_score)
                 recall_list.append(recall_score)
-                hit_list.append(hit)
+                hit1_list.append(hit1)
                 acc_list.append(recall_score)
-                f2.write(json.dumps({'id': id, 'prediction': prediction, 'ground_truth': answer, 'hit': hit, 'f1': f1_score, 'precision': precision_score, 'recall': recall_score, 'hal_score': hal_score}) + '\n')
+                f2.write(json.dumps({'id': id, 'prediction': prediction, 'ground_truth': answer, 'hit1': hit1, 'f1': f1_score, 'precision': precision_score, 'recall': recall_score, 'hal_score': hal_score}) + '\n')
             else:
                 raise NotImplementedError
-    if len(hit_list) == 0:
+    if len(hit1_list) == 0:
         null_out = [0] * 13
         null_out.append(None)
         return null_out
 
-    avg_hit = sum(hit_list) * 100 / len(hit_list)
+    avg_hit1 = sum(hit1_list) * 100 / len(hit1_list)
     avg_f1 = sum(f1_list) * 100 / len(f1_list)
     avg_precision = sum(precision_list) * 100 / len(precision_list)
     avg_recall = sum(recall_list) * 100 / len(recall_list)
@@ -370,13 +395,13 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
     micro_recall = total_match / total_answer
     micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall)
 
-    result_str = f"Hit@1: {avg_hit}, Macro F1: {avg_f1}, Macro Precision: {avg_precision}, Macro Recall: {avg_recall}, Exact Match: {num_exact_match}, Totally Wrong: {num_totally_wrong}, Hal Score: {avg_hal_score}"
+    result_str = f"Hit@1: {avg_hit1}, Macro F1: {avg_f1}, Macro Precision: {avg_precision}, Macro Recall: {avg_recall}, Exact Match: {num_exact_match}, Totally Wrong: {num_totally_wrong}, Hal Score: {avg_hal_score}"
     print(result_str)
-    print(f"Micro F1: {micro_f1}, Micro precision: {micro_precision}, Micro Recall: {micro_recall}")
+    print(f"Micro F1: {micro_f1 * 100}, Micro precision: {micro_precision * 100}, Micro Recall: {micro_recall * 100}")
     print(f"Total number of samples: {total_cnt}, no answer samples: {no_ans_cnt}, ratio: {no_ans_cnt / total_cnt}")
 
     result_name = 'eval_result_corrected.txt'
     eval_result_path = predict_file.replace('predictions.jsonl', result_name)
     with open(eval_result_path, 'w') as f:
         f.write(result_str)
-    return avg_hit, avg_f1, avg_precision, avg_recall, num_exact_match, num_totally_wrong, micro_f1, micro_precision, micro_recall, total_cnt, no_ans_cnt, no_ans_cnt / total_cnt, avg_hal_score, stats
+    return avg_hit1, avg_f1, avg_precision, avg_recall, num_exact_match, num_totally_wrong, micro_f1, micro_precision, micro_recall, total_cnt, no_ans_cnt, no_ans_cnt / total_cnt, avg_hal_score, stats

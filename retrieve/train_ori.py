@@ -12,9 +12,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.config.retriever import load_yaml
-from src.dataset.retriever import RetrieverDataset, collate_retriever
-from src.model.retriever import Retriever
-from src.setup import set_seed, prepare_sample
+from src.dataset.retriever_ori import RetrieverDataset, collate_retriever
+from src.model.retriever_ori import Retriever
+from src.setup_ori import set_seed, prepare_sample
 
 @torch.no_grad()
 def eval_epoch(config, device, data_loader, model):
