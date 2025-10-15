@@ -1,0 +1,42 @@
+**/__pycache__
+retrieve/wandb
+reason/wandb
+*.pth
+retrieve/data_files
+retrieve/results
+reason/results
+# Large data files
+kge/data/
+*.txt
+*.bin
+*.h5
+*.npy
+*.npz
+
+# Model checkpoints and embeddings
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Data directories
+retrieve/data_files/
+reason/data/
+kge/data/
+
+# Results and logs
+retrieve/results/
+reason/results/
+reason/gpt_labeled/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Additional large artifacts (ignore and avoid committing heavy files)
+kge/logs/
+kge/wandb/
+pykeen/pykeen_result/
