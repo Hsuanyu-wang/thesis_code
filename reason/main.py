@@ -321,7 +321,11 @@ def run_single_experiment(args):
                 score_dict_path = score_dict_path.strip()
     
     # 預測結果暫存檔案夾與檔案路徑（支援 resume）
-    raw_pred_folder_path = Path(f"./results/KGQA/{dataset_name}/SubgraphRAG/{args.model_name.split('/')[-1]}")
+    # 測試模式：使用 testing 目錄
+    if getattr(args, "test_mode", False):
+        raw_pred_folder_path = Path(f"./results/KGQA/{dataset_name}/SubgraphRAG/testing")
+    else:
+        raw_pred_folder_path = Path(f"./results/KGQA/{dataset_name}/SubgraphRAG/{args.model_name.split('/')[-1]}")
     raw_pred_folder_path.mkdir(parents=True, exist_ok=True)
     
     # 為本模型準備統一的 CSV 路徑（保持在模型根目錄）
@@ -361,6 +365,11 @@ def run_single_experiment(args):
     if reverse_order:
         experiment_name += "_rev_seq"
     
+    # 測試模式：添加 _test_{k} 後綴
+    if getattr(args, "test_mode", False):
+        test_k = getattr(args, "test_k", 10)
+        experiment_name += f"_test_{test_k}"
+    
     # 實驗特定檔案路徑（存到實驗 ID 資料夾）
     raw_pred_file_path = None
     if do_infer:
@@ -398,6 +407,26 @@ def run_single_experiment(args):
         llm = llm_init(model_name, tensor_parallel_size, max_seq_len_to_capture, max_tokens, seed, temperature, frequency_penalty)
         # 取得資料
         data = get_data(dataset_name, pred_file_path, score_dict_path, split, prompt_mode)
+        
+        # 測試模式：對資料進行採樣
+        if getattr(args, "test_mode", False):
+            test_k = getattr(args, "test_k", 10)
+            test_random = getattr(args, "test_random", False)
+            
+            original_data_size = len(data)
+            if original_data_size > test_k:
+                if test_random:
+                    # 隨機採樣
+                    random.seed(seed)  # 使用相同的seed確保可重現性
+                    data = random.sample(data, test_k)
+                    print(f"Test mode: Randomly sampled {test_k} samples from {original_data_size} total samples")
+                else:
+                    # 固定採樣（取前k個）
+                    data = data[:test_k]
+                    print(f"Test mode: Using first {test_k} samples from {original_data_size} total samples")
+            else:
+                print(f"Test mode: Dataset size ({original_data_size}) <= test_k ({test_k}), using all samples")
+        
         # 取得 prompt
         sys_prompt, cot_prompt = get_defined_prompts(prompt_mode, model_name, llm_mode)
         print("Generating prompts...")
@@ -405,12 +434,32 @@ def run_single_experiment(args):
         data = get_prompts_for_data(data, prompt_mode, sys_prompt, cot_prompt, thres)
     
         print("Starting inference...")
+        # 初始化token計數器
+        total_input_tokens = 0
+        total_output_tokens = 0
+        
         # 取得已處理的資料數（支援 resume）
         start_idx = len(load_checkpoint(raw_pred_file_path))
         with open(raw_pred_file_path, "a") as pred_file:
             # 逐筆進行推論
             for idx, each_qa in enumerate(tqdm(data[start_idx:], initial=start_idx, total=len(data))):
-                res = llm_inf_all(llm, each_qa, llm_mode, model_name)
+                # 在第一次推理時顯示input token數量
+                if idx == 0:
+                    # 計算第一個樣本的input token數量（用於顯示）
+                    sample_input_tokens = 0
+                    if 'sys' in llm_mode:
+                        sample_input_tokens += len(each_qa['sys_query'].split()) // 0.75 if 'sys_query' in each_qa else 0
+                    if 'icl' in llm_mode:
+                        sample_input_tokens += len(each_qa.get('user_query', '').split()) // 0.75
+                    if 'user_query' in each_qa:
+                        sample_input_tokens += len(each_qa['user_query'].split()) // 0.75
+                    print(f"Estimated input tokens per sample: {int(sample_input_tokens)}")
+                
+                res, input_tokens, output_tokens = llm_inf_all(llm, each_qa, llm_mode, model_name)
+                
+                # 累計token數量
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
 
                 # 移除不需要儲存的欄位，減少檔案大小（若不存在則忽略）
                 for k in ["graph", "good_paths_rog", "good_triplets_rog", "scored_triplets"]:
@@ -419,6 +468,14 @@ def run_single_experiment(args):
                 # 儲存預測結果
                 each_qa["prediction"] = res[0]
                 save_checkpoint(pred_file, each_qa)
+        
+        # 在推理結束時顯示總token數量
+        print(f"\n{'='*50}")
+        print(f"Token Usage Summary:")
+        print(f"Total Input Tokens: {total_input_tokens:,}")
+        print(f"Total Output Tokens: {total_output_tokens:,}")
+        print(f"Total Tokens: {total_input_tokens + total_output_tokens:,}")
+        print(f"{'='*50}")
     
         # 處理完成後，將檔案重新命名（移除 -resume）
         final_pred_file_path = raw_pred_file_path.with_name(raw_pred_file_path.stem.replace("-resume", "") + raw_pred_file_path.suffix)
@@ -456,19 +513,26 @@ def main():
     parser.add_argument("-p", "--score_dict_path", type=str)
     parser.add_argument("--llm_mode", type=str, default="sys_icl_dc", help="LLM mode")
     parser.add_argument("-m", "--model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", help="Model name")
+    # meta-llama/Llama-3.2-3B, gpt-oss:20b, gpt-oss:120b, Qwen/Qwen3-8B
     parser.add_argument("--split", type=str, default="test", help="Split")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument("--max_seq_len_to_capture", type=int, default=8192, help="Max sequence length to capture")
+    parser.add_argument("--max_seq_len_to_capture", type=int, default=8192 * 2, help="Max sequence length to capture")
     parser.add_argument("--max_tokens", type=int, default=4000, help="Max tokens")
     parser.add_argument("--seed", type=int, default=0, help="Seed")
     parser.add_argument("--temperature", type=float, default=0, help="Temperature")
     parser.add_argument("--frequency_penalty", type=float, default=0.16, help="Frequency penalty")
     parser.add_argument("--thres", type=float, default=0.0, help="Threshold")
+    
     parser.add_argument("--auto_run_all", action="store_true", help="Automatically run all retrieval_result.pth files in training directory")
     parser.add_argument("--force_rerun", action="store_true", help="Force rerun even if results already exist")
     parser.add_argument("--run_mode", type=str, choices=["both", "infer", "eval"], default="both", help="Run only inference, only evaluation, or both")
     parser.add_argument("--pred_file", type=str, default=None, help="Path to an existing predictions.jsonl for eval-only mode")
+    
     parser.add_argument("-rev", "--reverse_order", action="store_true", help="Reverse the order of triplets for evaluation")
+    
+    parser.add_argument("--test_mode", action="store_true", help="Enable test mode for sampling limited data")
+    parser.add_argument("--test_k", type=int, default=10, help="Number of samples to use in test mode (default: 10)")
+    parser.add_argument("--test_random", action="store_true", help="Use random sampling in test mode (default: fixed samples)")
 
     args = parser.parse_args()
     

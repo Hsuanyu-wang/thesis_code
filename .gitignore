@@ -40,3 +40,9 @@ Thumbs.db
 kge/logs/
 kge/wandb/
 pykeen/pykeen_result/
+PyG/data/
+PyG/wandb/
+PyG/model
+kge/
+
+hotpotQA/

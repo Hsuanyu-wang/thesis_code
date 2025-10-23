@@ -1,8 +1,6 @@
 ###################################################################//
-#  cpt7
-# + no_dde
-# + rerank
-# + PRA (Path Ranking Algorithm)
+# cpt5
+# + cwq & args function
 ###################################################################\\
 import numpy as np
 import os
@@ -28,84 +26,6 @@ except Exception:
 from src.model.retriever import Retriever
 from src.model.kge_weight_scorer import create_kge_weight_scorer
 from src.setup import set_seed, prepare_sample
-
-@torch.no_grad()
-def run_inference_with_rerank(config, device, infer_set, model, args, save_dir: str,
-                              max_candidates: int = 500, top_k: int = 100, split_name: str = 'val'):
-    """Run inference: select many candidates via retriever, then rerank by a KGE model.
-
-    Saves a dict keyed by sample id with fields: question, scored_triples[(h,r,t,score)], q/a entities.
-    """
-    model.eval()
-
-    # Build KGE scorer for reranking
-    kge_model_path, kge_model_type = _get_kge_model_info(args.rerank_kge_model, args.dataset)
-    kge_scorer = create_kge_weight_scorer(
-        kge_model_path=kge_model_path,
-        kge_model_type=kge_model_type,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        weight_mode=args.rerank_kge_weight_mode
-    )
-
-    pred_dict = dict()
-    pbar = tqdm(range(len(infer_set)), desc=f"Inference+Rerank ({split_name})")
-    for i in pbar:
-        raw_sample = infer_set[i]
-        sample = collate_retriever([raw_sample])
-        h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs, \
-            num_non_text_entities, relation_embs, topic_entity_one_hot, \
-            target_triple_probs, a_entity_id_list = prepare_sample(device, sample)
-
-        entity_list = raw_sample['text_entity_list'] + raw_sample['non_text_entity_list']
-        relation_list = raw_sample['relation_list']
-
-        scored_triples = []
-        if len(h_id_tensor) != 0:
-            # 1) Retriever scores
-            retriever_logits = model.forward_legacy(
-                h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs,
-                num_non_text_entities, relation_embs, topic_entity_one_hot
-            ).reshape(-1)
-            retriever_scores = torch.sigmoid(retriever_logits)
-            # 2) Take top-N candidates by retriever
-            topN = min(int(max_candidates), int(retriever_scores.numel()))
-            topN_results = torch.topk(retriever_scores, topN)
-            cand_idx = topN_results.indices
-
-            # 3) KGE rerank on those candidates
-            h_sel = h_id_tensor[cand_idx]
-            r_sel = r_id_tensor[cand_idx]
-            t_sel = t_id_tensor[cand_idx]
-            kge_scores = kge_scorer.compute_triple_weights(h_sel, r_sel, t_sel)
-
-            # 4) Final top-k by KGE score
-            final_k = min(int(top_k), int(kge_scores.numel()))
-            final_idx_in_cands = torch.topk(kge_scores, final_k).indices
-            chosen_idx = cand_idx[final_idx_in_cands]
-            final_scores = kge_scores[final_idx_in_cands].detach().cpu().tolist()
-
-            for j, triple_id in enumerate(chosen_idx.cpu().tolist()):
-                scored_triples.append((
-                    entity_list[h_id_tensor[triple_id].item()],
-                    relation_list[r_id_tensor[triple_id].item()],
-                    entity_list[t_id_tensor[triple_id].item()],
-                    final_scores[j]
-                ))
-
-        sample_dict = {
-            'question': raw_sample.get('question'),
-            'scored_triples': scored_triples,
-            'q_entity': raw_sample.get('q_entity'),
-            'q_entity_in_graph': [entity_list[e_id] for e_id in raw_sample.get('q_entity_id_list', [])],
-            'a_entity': raw_sample.get('a_entity'),
-            'a_entity_in_graph': [entity_list[e_id] for e_id in raw_sample.get('a_entity_id_list', [])],
-            'max_path_length': raw_sample.get('max_path_length'),
-        }
-        pred_dict[raw_sample['id']] = sample_dict
-
-    out_path = os.path.join(save_dir, f'infer_{split_name}_rerank.pt')
-    torch.save(pred_dict, out_path)
-    print(f"💾 Inference+Rerank saved to: {out_path}")
 
 @torch.no_grad()
 def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_epochs=None):
@@ -139,11 +59,6 @@ def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_ep
             target_triple_probs_device = target_triple_probs.to(device).unsqueeze(-1)
             if args.spcount:
                 sp_weights = target_triple_probs_device.clone()
-                # smoothing on counts
-                if getattr(args, 'spcount_smooth', 'none') == 'log':
-                    sp_weights = torch.log1p(sp_weights)
-                elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                    sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
                 sp_weights = sp_weights + 1.0
                 positive_mask = (target_triple_probs_device > 0).float()
                 bce_loss = F.binary_cross_entropy_with_logits(
@@ -153,11 +68,6 @@ def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_ep
             elif args.spcount_inv:
                 sp_weights = target_triple_probs_device.clone()
                 positive_mask = (target_triple_probs_device > 0).float()
-                # smoothing on counts before inversion
-                if getattr(args, 'spcount_smooth', 'none') == 'log':
-                    sp_weights = torch.log1p(sp_weights)
-                elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                    sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
                 inv_weights = torch.where(
                     sp_weights > 0, 
                     1.0 / (sp_weights + 1.0),
@@ -184,15 +94,6 @@ def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_ep
                 positive_mask = (target_triple_probs_device > 0).float()
                 val_loss = F.binary_cross_entropy_with_logits(
                     pred_triple_logits, positive_mask)
-            
-            # 新增 KGE regularization loss
-            kge_reg_loss = None
-            if args and args.kge_regularization:
-                kge_scorer = getattr(args, 'kge_scorer', None)
-                if kge_scorer is not None:
-                    kge_reg_loss = kge_scorer.compute_regularization_loss(
-                        h_id_tensor, r_id_tensor, t_id_tensor)
-                    val_loss = val_loss + args.kge_regularization_weight * kge_reg_loss
             
             val_loss_list.append(val_loss.item())
         ####################################################################################\
@@ -264,11 +165,6 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
             # target_triple_probs 已經包含了每個 triple 在 shortest path 中出現的次數
             # 我們將這個計數+1作為權重（避免0權重）
             sp_weights = target_triple_probs.clone()
-            # smoothing on counts
-            if getattr(args, 'spcount_smooth', 'none') == 'log':
-                sp_weights = torch.log1p(sp_weights)
-            elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
             sp_weights = sp_weights + 1.0  # 基礎權重為1，然後加上 shortest path 計數
             
             # 對於正樣本和負樣本分別處理
@@ -279,11 +175,6 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
                 pred_triple_logits, positive_mask, reduction='none')
             weighted_loss = bce_loss * sp_weights.squeeze(-1)
             loss = weighted_loss.mean()
-            bce_loss = bce_loss.mean()  # 計算平均 BCE loss 用於記錄
-            
-            # 記錄採用的權重方法（僅在第一批次顯示）
-            if batch_idx == 0:
-                print(f"📊 Using weight method: SP count (shortest path frequency)")
             
         elif args.spcount_inv:
             # spcount_inv: 使用 shortest path 計數的倒數作為權重
@@ -291,11 +182,6 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
             positive_mask = (target_triple_probs > 0).float()
             
             # 計算倒數權重，避免除零
-            # smoothing on counts before inversion
-            if getattr(args, 'spcount_smooth', 'none') == 'log':
-                sp_weights = torch.log1p(sp_weights)
-            elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
             inv_weights = torch.where(
                 sp_weights > 0, 
                 1.0 / (sp_weights + 1.0),  # 倒數權重
@@ -307,11 +193,6 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
                 pred_triple_logits, positive_mask, reduction='none')
             weighted_loss = bce_loss * inv_weights.squeeze(-1)
             loss = weighted_loss.mean()
-            bce_loss = bce_loss.mean()  # 計算平均 BCE loss 用於記錄
-            
-            # 記錄採用的權重方法（僅在第一批次顯示）
-            if batch_idx == 0:
-                print(f"📊 Using weight method: SP count inverse (1/shortest path frequency)")
             
         elif args.kge_bce_weight:
             # kge_bce_weight: 使用 KGE 模型分數作為權重
@@ -333,64 +214,27 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
                 pred_triple_logits, positive_mask, reduction='none')
             weighted_loss = bce_loss * kge_weights.squeeze(-1)
             loss = weighted_loss.mean()
-            bce_loss = bce_loss.mean()  # 計算平均 BCE loss 用於記錄
-            
-            # 記錄採用的權重方法（僅在第一批次顯示）
-            if batch_idx == 0:
-                print(f"📊 Using weight method: KGE BCE weight ({args.kge_model}, {args.kge_weight_mode})")
             
         else:
             # 標準的 BCE loss
             positive_mask = (target_triple_probs > 0).float()
-            bce_loss = F.binary_cross_entropy_with_logits(
+            loss = F.binary_cross_entropy_with_logits(
                 pred_triple_logits, positive_mask)
-            loss = bce_loss
-            
-            # 記錄採用的權重方法（僅在第一批次顯示）
-            if batch_idx == 0:
-                print(f"📊 Using weight method: Standard BCE loss (no weighting)")
-        
-        # 新增 KGE regularization loss
-        kge_reg_loss = None
-        if args.kge_regularization:
-            kge_scorer = getattr(args, 'kge_scorer', None)
-            if kge_scorer is not None:
-                # 計算 KGE regularization loss
-                kge_reg_loss = kge_scorer.compute_regularization_loss(
-                    h_id_tensor, r_id_tensor, t_id_tensor)
-                # 將 KGE regularization 加入總 loss
-                loss = loss + args.kge_regularization_weight * kge_reg_loss
-        
         ###################################################################\\
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
-        # 計算各種 loss 值用於記錄
-        total_loss_item = loss.item()
-        bce_loss_item = bce_loss.item() if isinstance(bce_loss, torch.Tensor) else bce_loss
-        kge_reg_loss_item = kge_reg_loss.item() if kge_reg_loss is not None else 0.0
-        
-        epoch_loss += total_loss_item
+        loss = loss.item()
+        epoch_loss += loss
 
-        # Update progress bar with detailed loss information
-        if args.kge_regularization:
-            train_pbar.set_postfix({
-                'total': f'{total_loss_item:.4f}',
-                'bce': f'{bce_loss_item:.4f}',
-                'kge': f'{kge_reg_loss_item:.4f}'
-            })
-        else:
-            train_pbar.set_postfix({'loss': f'{total_loss_item:.4f}'})
+        # Update progress bar with current loss
+        train_pbar.set_postfix({'loss': f'{loss:.4f}'})
     
     train_pbar.close()
     epoch_loss /= len(train_loader)
     
-    log_dict = {
-        'loss': epoch_loss,
-        'bce_loss': bce_loss_item,
-        'kge_reg_loss': kge_reg_loss_item
-    }
+    log_dict = {'loss': epoch_loss}
     return log_dict
 
 ###################################################################//
@@ -503,53 +347,12 @@ def eval_epoch_cwq(config, device, data_loader, model, args=None, epoch=None, nu
                     num_total = len(target)
                     pos_weight = torch.tensor([(num_total - num_positive) / num_total if num_positive > 0 else 1.0], device=device)
                     val_loss = F.binary_cross_entropy_with_logits(pred_triple_logits, target, pos_weight=pos_weight)
-            elif args and args.kge_bce_weight:
-                # kge_bce_weight: 使用 KGE 模型分數作為權重
-                positive_mask = (target > 0).float()
-                
-                # 從 args 獲取 KGE 權重計算器
-                kge_scorer = getattr(args, 'kge_scorer', None)
-                if kge_scorer is not None and 'h_id_tensors' in batch:
-                    # 計算當前樣本的 KGE 權重
-                    sample_h_ids = batch['h_id_tensors'][i]
-                    sample_r_ids = batch['r_id_tensors'][i]
-                    sample_t_ids = batch['t_id_tensors'][i]
-                    
-                    if len(sample_h_ids) > 0:
-                        kge_weights = kge_scorer.compute_triple_weights(
-                            sample_h_ids, sample_r_ids, sample_t_ids)
-                    else:
-                        kge_weights = torch.ones_like(target)
-                else:
-                    # 如果沒有 KGE scorer 或數據，使用標準權重
-                    kge_weights = torch.ones_like(target)
-                
-                # 計算加權的 BCE loss
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    pred_triple_logits, positive_mask, reduction='none')
-                weighted_loss = bce_loss * kge_weights
-                val_loss = weighted_loss.mean()
             else:
                 # 標準的 BCE loss
                 num_positive = target.sum().item()
                 num_total = len(target)
                 pos_weight = torch.tensor([(num_total - num_positive) / num_total if num_positive > 0 else 1.0], device=device)
                 val_loss = F.binary_cross_entropy_with_logits(pred_triple_logits, target, pos_weight=pos_weight)
-            
-            # 新增 KGE regularization loss
-            kge_reg_loss = None
-            if args and args.kge_regularization:
-                kge_scorer = getattr(args, 'kge_scorer', None)
-                if kge_scorer is not None and 'h_id_tensors' in batch:
-                    # 計算當前樣本的 KGE regularization loss
-                    sample_h_ids = batch['h_id_tensors'][i]
-                    sample_r_ids = batch['r_id_tensors'][i]
-                    sample_t_ids = batch['t_id_tensors'][i]
-                    
-                    if len(sample_h_ids) > 0:
-                        kge_reg_loss = kge_scorer.compute_regularization_loss(
-                            sample_h_ids, sample_r_ids, sample_t_ids)
-                        val_loss = val_loss + args.kge_regularization_weight * kge_reg_loss
             
             val_losses.append(val_loss.item())
 
@@ -653,32 +456,6 @@ def train_epoch_cwq(device, train_loader, model, optimizer, args=None, epoch=Non
                     num_total = len(target)
                     pos_weight = torch.tensor([(num_total - num_positive) / num_total if num_positive > 0 else 1.0], device=device)
                     sample_loss = F.binary_cross_entropy_with_logits(pred_logits, target, pos_weight=pos_weight)
-            elif args and args.kge_bce_weight:
-                # kge_bce_weight: 使用 KGE 模型分數作為權重
-                positive_mask = (target > 0).float()
-                
-                # 從 args 獲取 KGE 權重計算器
-                kge_scorer = getattr(args, 'kge_scorer', None)
-                if kge_scorer is not None and 'h_id_tensors' in batch:
-                    # 計算當前樣本的 KGE 權重
-                    sample_h_ids = batch['h_id_tensors'][i]
-                    sample_r_ids = batch['r_id_tensors'][i]
-                    sample_t_ids = batch['t_id_tensors'][i]
-                    
-                    if len(sample_h_ids) > 0:
-                        kge_weights = kge_scorer.compute_triple_weights(
-                            sample_h_ids, sample_r_ids, sample_t_ids)
-                    else:
-                        kge_weights = torch.ones_like(target)
-                else:
-                    # 如果沒有 KGE scorer 或數據，使用標準權重
-                    kge_weights = torch.ones_like(target)
-                
-                # 計算加權的 BCE loss
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    pred_logits, positive_mask, reduction='none')
-                weighted_loss = bce_loss * kge_weights
-                sample_loss = weighted_loss.mean()
             else:
                 # 標準的 BCE loss
                 num_positive = target.sum().item()
@@ -688,108 +465,83 @@ def train_epoch_cwq(device, train_loader, model, optimizer, args=None, epoch=Non
             
             loss = loss + sample_loss
             valid += 1
-        
-        # 新增 KGE regularization loss (在整個 batch 上計算)
-        if args and args.kge_regularization:
-            kge_scorer = getattr(args, 'kge_scorer', None)
-            if kge_scorer is not None and valid > 0:
-                # 計算整個 batch 的 KGE regularization loss
-                batch_h_ids = torch.cat([h for h in batch['h_id_tensors'] if len(h) > 0])
-                batch_r_ids = torch.cat([r for r in batch['r_id_tensors'] if len(r) > 0])
-                batch_t_ids = torch.cat([t for t in batch['t_id_tensors'] if len(t) > 0])
-                
-                if len(batch_h_ids) > 0:
-                    kge_reg_loss = kge_scorer.compute_regularization_loss(
-                        batch_h_ids, batch_r_ids, batch_t_ids)
-                    loss = loss + args.kge_regularization_weight * kge_reg_loss
-        
         if valid > 0:
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            
-            # 計算各種 loss 值用於記錄
-            total_loss_item = loss.item()
-            total_loss += total_loss_item
+            total_loss += loss.item()
             num_samples += valid
-            
-            # 計算 KGE regularization loss 用於顯示
-            kge_reg_loss_item = 0.0
-            if args and args.kge_regularization:
-                kge_scorer = getattr(args, 'kge_scorer', None)
-                if kge_scorer is not None and 'h_id_tensors' in batch:
-                    # 計算當前 batch 的 KGE regularization loss
-                    batch_h_ids = torch.cat([h for h in batch['h_id_tensors'] if len(h) > 0])
-                    batch_r_ids = torch.cat([r for r in batch['r_id_tensors'] if len(r) > 0])
-                    batch_t_ids = torch.cat([t for t in batch['t_id_tensors'] if len(t) > 0])
-                    
-                    if len(batch_h_ids) > 0:
-                        kge_reg_loss = kge_scorer.compute_regularization_loss(
-                            batch_h_ids, batch_r_ids, batch_t_ids)
-                        kge_reg_loss_item = kge_reg_loss.item()
-            
-            # 估算 BCE loss (總 loss 減去 KGE regularization loss)
-            bce_loss_item = total_loss_item - args.kge_regularization_weight * kge_reg_loss_item if args and args.kge_regularization else total_loss_item
-            
-            # Update progress bar with detailed loss information
-            if args and args.kge_regularization:
-                train_pbar.set_postfix({
-                    'total': f'{total_loss_item:.4f}',
-                    'bce': f'{bce_loss_item:.4f}',
-                    'kge': f'{kge_reg_loss_item:.4f}'
-                })
-            else:
-                train_pbar.set_postfix({'loss': f'{total_loss_item:.4f}'})
-    
+            train_pbar.set_postfix({'loss': f'{(total_loss/num_samples):.4f}'})
     train_pbar.close()
     avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
-    avg_bce_loss = avg_loss - args.kge_regularization_weight * kge_reg_loss_item if args and args.kge_regularization else avg_loss
-    avg_kge_reg_loss = kge_reg_loss_item if args and args.kge_regularization else 0.0
-    
-    return {
-        'loss': avg_loss,
-        'bce_loss': avg_bce_loss,
-        'kge_reg_loss': avg_kge_reg_loss
-    }
+    return {'loss': avg_loss}
 
 def _get_kge_model_info(model_type, dataset_name):
     """
     根據模型類型和數據集名稱返回對應的路徑和類型
     
     Args:
-        model_type: 模型類型 ('transe', 'distmult', 'complex')
+        model_type: 模型類型 ('transe', 'distmult', 'complex', 'auto')
         dataset_name: 數據集名稱 ('webqsp', 'cwq')
     
     Returns:
         tuple: (model_path, model_type)
     """
-    # 使用 PyG model webqsp 目錄中的預訓練模型
-    kge_models_dir = f'/home/YX_thesis/PyG/model/{dataset_name}'
+    # kge_models_dir = '/home/YX_thesis/pykeen/kge_models'
+    kge_models_dir = '/home/YX_thesis/pykeen/pykeen_result'
     
-    if model_type == 'transe':
-        # 使用對應數據集的 TransE 模型
-        model_path = os.path.join(kge_models_dir, f'transe_{dataset_name}_epoch_200.pt')
+    if model_type == 'auto':
+
+        preferred_models = [
+            ('TransE_FB15k_237/trained_model.pkl', 'TransE'),
+            ('DistMult_FB15k_237/trained_model.pkl', 'DistMult'),
+            ('ComplEx_FB15k_237/trained_model.pkl', 'ComplEx'),
+            ('RotatE_FB15k_237/trained_model.pkl', 'Rotate'),
+        ]
+        
+        for model_file, model_class in preferred_models:
+            model_path = os.path.join(kge_models_dir, model_file)
+            if os.path.exists(model_path):
+                return model_path, model_class
+        
+        # 如果沒有找到預設模型，使用第一個可用的
+        if os.path.exists(kge_models_dir):
+            available_files = [f for f in os.listdir(kge_models_dir) if f.endswith('.pt')]
+            if available_files:
+                model_path = os.path.join(kge_models_dir, available_files[0])
+                # 根據文件名推斷模型類型
+                model_class = 'TransE'  # 預設
+                if 'distmult' in available_files[0].lower():
+                    model_class = 'DistMult'
+                elif 'complex' in available_files[0].lower():
+                    model_class = 'ComplEx'
+                elif 'rotate' in available_files[0].lower():
+                    model_class = 'Rotate'
+                return model_path, model_class
+    
+    elif model_type == 'transe':
+        # 使用 FB15k-237 預訓練模型
+        model_path = os.path.join(kge_models_dir, 'TransE_FB15k_237', 'trained_model.pkl')
         if os.path.exists(model_path):
             return model_path, 'TransE'
     
     elif model_type == 'distmult':
-        model_path = os.path.join(kge_models_dir, f'distmult_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, 'DistMult_FB15k_237', 'trained_model.pkl')
         if os.path.exists(model_path):
             return model_path, 'DistMult'
     
     elif model_type == 'complex':
-        model_path = os.path.join(kge_models_dir, f'complex_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, 'ComplEx_FB15k_237', 'trained_model.pkl')
         if os.path.exists(model_path):
             return model_path, 'ComplEx'
     
     elif model_type == 'rotate':
-        model_path = os.path.join(kge_models_dir, f'rotate_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, 'RotatE_FB15k_237', 'trained_model.pkl')
         if os.path.exists(model_path):
-            return model_path, 'RotatE'
+            return model_path, 'Rotate'
     
-    # 預設回退到 TransE
-    print(f"🔍 No model found for {model_type} on {dataset_name}, using default model: {os.path.join(kge_models_dir, f'transe_{dataset_name}_epoch_200.pt')}")
-    return os.path.join(kge_models_dir, f'transe_{dataset_name}_epoch_200.pt'), 'TransE'
+    # 預設回退
+    return os.path.join(kge_models_dir, 'TransE_FB15k_237', 'trained_model.pkl'), 'TransE'
 
 ###################################################################//
 def check_and_warn_resources(args):
@@ -828,34 +580,10 @@ def main(args):
     print(f"   SP count inverse: {args.spcount_inv}")
     print(f"   KGE weight: {args.kge_bce_weight}")
     print(f"   KGE freq weight: {args.kge_shortest_path}")
-    print(f"   KGE regularization: {args.kge_regularization}")
-    if args.kge_regularization:
-        print(f"   KGE regularization weight: {args.kge_regularization_weight}")
     print(f"   Path weight: {('none' if getattr(args, 'path_weight', None) is None else args.path_weight)}")
-    print(f"   Use DDE: {not args.no_dde}")
-    print(f"   Use PRA: {args.use_pra}")
-    if args.use_pra:
-        print(f"   PRA max path length: {args.pra_max_path_length}")
-        print(f"   PRA max paths: {args.pra_max_paths}")
-        print(f"   PRA use freq weight: {args.pra_use_freq_weight}")
-    if args.kge_bce_weight or args.kge_shortest_path or args.kge_regularization:
+    if args.kge_bce_weight or args.kge_shortest_path:
         print(f"   KGE model: {args.kge_model}")
         print(f"   KGE weight mode: {args.kge_weight_mode}")
-    
-    # 檢查權重方法衝突
-    weight_methods = []
-    if args.spcount:
-        weight_methods.append("SP count")
-    if args.spcount_inv:
-        weight_methods.append("SP count inverse")
-    if args.kge_bce_weight:
-        weight_methods.append("KGE BCE weight")
-    
-    if len(weight_methods) > 1:
-        print(f"⚠️  WARNING: Multiple weight methods detected: {', '.join(weight_methods)}")
-        print(f"⚠️  Due to 'elif' structure, only the first method will be used: {weight_methods[0]}")
-        print(f"⚠️  Other methods will be ignored in this training run.")
-    
     print(f"===============================")
     
     # Check system resources
@@ -863,7 +591,7 @@ def main(args):
     
     # Initialize KGE weight scorer if needed
     kge_scorer = None
-    if args.kge_bce_weight or args.kge_shortest_path or args.kge_regularization:
+    if args.kge_bce_weight or args.kge_shortest_path:
         print(f"🔧 Initializing KGE weight scorer...")
         
         # 根據選擇的模型確定路徑和類型
@@ -886,8 +614,8 @@ def main(args):
                 print(f"   ❌ Failed to initialize KGE weight scorer")
         else:
             print(f"   ❌ KGE model not found at {kge_model_path}")
-            print(f"   Available models in webqsp/:")
-            kge_models_dir = '/home/YX_thesis/PyG/model/webqsp'
+            print(f"   Available models in kge_models/:")
+            kge_models_dir = '/home/YX_thesis/pykeen/kge_models'
             if os.path.exists(kge_models_dir):
                 for f in os.listdir(kge_models_dir):
                     if f.endswith('.pt'):
@@ -911,36 +639,24 @@ def main(args):
     # Add feature tags to experiment name
     feature_tags = []
     if args.freq_weight:
-        feature_tags.append('sp_freq_weight')
+        feature_tags.append('freq_weight')
     if args.freq_weight_inv:
-        feature_tags.append('sp_freq_weight_inv')
+        feature_tags.append('freq_weight_inv')
     if args.spcount:
-        feature_tags.append('bce_spcount')
+        feature_tags.append('spcount')
     if args.spcount_inv:
-        feature_tags.append('bce_spcount_inv')
+        feature_tags.append('spcount_inv')
     if args.kge_bce_weight:
-        feature_tags.append(f'bce_kge_{args.kge_model}_{args.kge_weight_mode}')
+        feature_tags.append(f'kge_{args.kge_model}_{args.kge_weight_mode}')
     if args.kge_shortest_path:
-        feature_tags.append(f'sp_kge_{args.kge_model}_{args.kge_weight_mode}')
-    if args.kge_regularization:
-        feature_tags.append(f'reg_kge_{args.kge_model}_{args.kge_regularization_weight}')
+        feature_tags.append(f'kge_shortest_path_{args.kge_model}_{args.kge_weight_mode}')
     if getattr(args, 'path_weight', None) is not None:
         feature_tags.append('pw_inv' if args.path_weight == 'inv' else 'pw')
     if args.use_dropout:
         feature_tags.append(f'drop{str(args.dropout_rate).replace(".", "_")}')
-    if args.no_dde:
-        feature_tags.append('no_dde')
-    if args.use_pra:
-        pra_tag = f'pra_l{args.pra_max_path_length}_p{args.pra_max_paths}'
-        if args.pra_use_freq_weight:
-            pra_tag += '_freq'
-        feature_tags.append(pra_tag)
     # Append early stop mode tag when enabled
     if args.early_stop_val in ('and', 'or'):
         feature_tags.append(f'esv_{args.early_stop_val}')
-    # Insert explicit experiment tag first (right after date), when provided
-    if getattr(args, 'exp_tag', None):
-        feature_tags = [str(args.exp_tag)] + feature_tags
         
     exp_name = exp_name_base if not feature_tags else f"{exp_name_base}_{'_'.join(feature_tags)}"
     
@@ -959,17 +675,7 @@ def main(args):
     use_cwq_optimized = (args.dataset == 'cwq' and _HAS_OPTIMIZED_DS)
     if use_cwq_optimized:
         # Map flags to weight_mode used by OptimizedRetrieverDataset
-        if args.kge_shortest_path:
-            # 對於 KGE shortest path，需要特殊處理
-            if kge_scorer is not None:
-                kge_model_type = kge_scorer.kge_model_type.lower()
-                weight_mode = f'kge_{kge_model_type}'
-            else:
-                weight_mode = 'kge_default'
-        elif args.kge_regularization:
-            # 對於 KGE regularization，使用標準模式
-            weight_mode = 'none'
-        elif args.freq_weight:
+        if args.freq_weight:
             weight_mode = 'freq'
         elif args.freq_weight_inv:
             weight_mode = 'inv'
@@ -979,7 +685,6 @@ def main(args):
             weight_mode = 'spcount_inv'
         else:
             weight_mode = 'none'
-        
         train_set = OptimizedRetrieverDataset(
             config=config,
             split='train',
@@ -1044,43 +749,22 @@ def main(args):
                 num_workers=2,
             )
     else:
-        # 檢查是否使用PRA
-        if args.use_pra:
-            from src.dataset.retriever_pra import RetrieverDatasetPRA
-            print("🔍 Using Path Ranking Algorithm (PRA) for supervision signal")
-            train_set = RetrieverDatasetPRA(
-                config=config, split='train', 
-                skip_no_path=True,
-                use_pra=True,
-                pra_max_path_length=args.pra_max_path_length,
-                pra_max_paths=args.pra_max_paths,
-                pra_use_freq_weight=args.pra_use_freq_weight
-            )
-            val_set = RetrieverDatasetPRA(
-                config=config, split='val', 
-                skip_no_path=True,
-                use_pra=True,
-                pra_max_path_length=args.pra_max_path_length,
-                pra_max_paths=args.pra_max_paths,
-                pra_use_freq_weight=args.pra_use_freq_weight
-            )
-        else:
-            train_set = RetrieverDataset(
-                config=config, split='train', 
-                skip_no_path=True,
-                freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
-                kge_shortest_path=args.kge_shortest_path,
-                path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
-                kge_scorer=kge_scorer
-            )
-            val_set = RetrieverDataset(
-                config=config, split='val', 
-                skip_no_path=True,
-                freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
-                kge_shortest_path=args.kge_shortest_path,
-                path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
-                kge_scorer=kge_scorer
-            )
+        train_set = RetrieverDataset(
+            config=config, split='train', 
+            skip_no_path=True,
+            freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
+            kge_shortest_path=args.kge_shortest_path,
+            path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
+            kge_scorer=kge_scorer
+        )
+        val_set = RetrieverDataset(
+            config=config, split='val', 
+            skip_no_path=True,
+            freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
+            kge_shortest_path=args.kge_shortest_path,
+            path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
+            kge_scorer=kge_scorer
+        )
         print(f"   Training samples: {len(train_set)}")
         print(f"   Validation samples: {len(val_set)}")
         train_loader = DataLoader(train_set, batch_size=1, shuffle=True, collate_fn=collate_retriever)
@@ -1088,41 +772,7 @@ def main(args):
     
     emb_size = train_set[0]['q_emb'].shape[-1]
     print(f"🧠 Creating model with embedding size: {emb_size}")
-    
-    # Modify retriever config to disable DDE if requested
-    retriever_config = config['retriever'].copy()
-    if args.no_dde:
-        print("🚫 DDE disabled - using simplified retriever architecture")
-        print("   This will reduce model complexity and may improve training speed")
-        # Set DDE parameters to disable it
-        retriever_config['DDE_kwargs'] = {
-            'num_rounds': 0,
-            'num_reverse_rounds': 0
-        }
-        # Verify that DDE is properly disabled
-        if retriever_config['DDE_kwargs']['num_rounds'] != 0 or retriever_config['DDE_kwargs']['num_reverse_rounds'] != 0:
-            print("⚠️  WARNING: DDE parameters not properly set to 0")
-        else:
-            print("   ✅ DDE parameters successfully set to 0")
-    
-    model = Retriever(emb_size, **retriever_config).to(device)
-    
-    # Display model parameter count
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"📊 Model parameters: {total_params:,} total, {trainable_params:,} trainable")
-    
-    if args.no_dde:
-        # Calculate approximate parameter reduction
-        dde_params = 0  # DDE parameters are 0 when disabled
-        print(f"   DDE parameters: {dde_params} (disabled)")
-    else:
-        # Estimate DDE parameters (this is approximate)
-        dde_rounds = retriever_config['DDE_kwargs']['num_rounds']
-        dde_reverse_rounds = retriever_config['DDE_kwargs']['num_reverse_rounds']
-        dde_params = (dde_rounds + dde_reverse_rounds) * 2 * 2  # Approximate
-        print(f"   DDE parameters: ~{dde_params} (enabled)")
-    
+    model = Retriever(emb_size, **config['retriever']).to(device)
     optimizer = Adam(model.parameters(), **config['optimizer'])
 
     # Create results directory
@@ -1138,10 +788,6 @@ def main(args):
     print(f"   Epochs: {num_epochs}")
     print(f"   Patience: {patience}")
     print(f"   K values for evaluation: {config['eval']['k_list']}")
-    if args.no_dde:
-        print(f"   Architecture: Simplified (DDE disabled)")
-    else:
-        print(f"   Architecture: Full (DDE enabled)")
     print("===============================")
     ###################################################################\\
         
@@ -1179,8 +825,6 @@ def main(args):
         log_payload = {
             'epoch': epoch,
             'train_loss': train_log_dict.get('loss', 0.0),
-            'train_bce_loss': train_log_dict.get('bce_loss', 0.0),
-            'train_kge_reg_loss': train_log_dict.get('kge_reg_loss', 0.0),
             'num_patient_epochs': num_patient_epochs,
             'num_patient_epochs_loss': num_patient_epochs_loss if enable_loss_early_stop else None
         }
@@ -1251,12 +895,8 @@ def main(args):
                 f.write(f"  SPO count inverse: {args.spcount_inv}\n")
                 f.write(f"  KGE weight: {args.kge_bce_weight}\n")
                 f.write(f"  KGE freq weight: {args.kge_shortest_path}\n")
-                f.write(f"  KGE regularization: {args.kge_regularization}\n")
-                if args.kge_regularization:
-                    f.write(f"  KGE regularization weight: {args.kge_regularization_weight}\n")
                 f.write(f"  Path weight: {('none' if getattr(args, 'path_weight', None) is None else args.path_weight)}\n")
-                f.write(f"  Use DDE: {not args.no_dde}\n")
-                if args.kge_bce_weight or args.kge_shortest_path or args.kge_regularization:
+                if args.kge_bce_weight or args.kge_shortest_path:
                     f.write(f"  KGE model: {args.kge_model}\n")
                     f.write(f"  KGE weight mode: {args.kge_weight_mode}\n")
                     # 記錄實際使用的 KGE 模型路徑和類型
@@ -1268,48 +908,23 @@ def main(args):
                 f.write(f"  Early stop mode: {early_stop_mode}\n")
         
         # Update progress bar display
-        if args.kge_regularization:
-            # 顯示詳細的 loss 信息
-            if enable_loss_early_stop:
-                main_pbar.set_postfix({
-                    'train_total': f"{train_log_dict.get('loss', 0.0):.4f}",
-                    'train_bce': f"{train_log_dict.get('bce_loss', 0.0):.4f}",
-                    'train_kge': f"{train_log_dict.get('kge_reg_loss', 0.0):.4f}",
-                    'val_loss': f'{current_val_loss:.4f}' if current_val_loss is not None else 'nan',
-                    'val_recall@100': f'{target_val_metric:.4f}',
-                    'best_recall@100': f'{best_val_metric:.4f}',
-                    'patience': f'{num_patient_epochs}/{patience}',
-                    'loss_patience': f'{num_patient_epochs_loss}/{patience}',
-                    'early_stop': early_stop_mode
-                })
-            else:
-                main_pbar.set_postfix({
-                    'train_total': f"{train_log_dict.get('loss', 0.0):.4f}",
-                    'train_bce': f"{train_log_dict.get('bce_loss', 0.0):.4f}",
-                    'train_kge': f"{train_log_dict.get('kge_reg_loss', 0.0):.4f}",
-                    'val_recall@100': f'{target_val_metric:.4f}',
-                    'best_recall@100': f'{best_val_metric:.4f}',
-                    'patience': f'{num_patient_epochs}/{patience}'
-                })
+        if enable_loss_early_stop:
+            main_pbar.set_postfix({
+                'train_loss': f"{train_log_dict.get('loss', 0.0):.4f}",
+                'val_loss': f'{current_val_loss:.4f}' if current_val_loss is not None else 'nan',
+                'val_recall@100': f'{target_val_metric:.4f}',
+                'best_recall@100': f'{best_val_metric:.4f}',
+                'patience': f'{num_patient_epochs}/{patience}',
+                'loss_patience': f'{num_patient_epochs_loss}/{patience}',
+                'early_stop': early_stop_mode
+            })
         else:
-            # 標準顯示
-            if enable_loss_early_stop:
-                main_pbar.set_postfix({
-                    'train_loss': f"{train_log_dict.get('loss', 0.0):.4f}",
-                    'val_loss': f'{current_val_loss:.4f}' if current_val_loss is not None else 'nan',
-                    'val_recall@100': f'{target_val_metric:.4f}',
-                    'best_recall@100': f'{best_val_metric:.4f}',
-                    'patience': f'{num_patient_epochs}/{patience}',
-                    'loss_patience': f'{num_patient_epochs_loss}/{patience}',
-                    'early_stop': early_stop_mode
-                })
-            else:
-                main_pbar.set_postfix({
-                    'train_loss': f"{train_log_dict.get('loss', 0.0):.4f}",
-                    'val_recall@100': f'{target_val_metric:.4f}',
-                    'best_recall@100': f'{best_val_metric:.4f}',
-                    'patience': f'{num_patient_epochs}/{patience}'
-                })
+            main_pbar.set_postfix({
+                'train_loss': f"{train_log_dict.get('loss', 0.0):.4f}",
+                'val_recall@100': f'{target_val_metric:.4f}',
+                'best_recall@100': f'{best_val_metric:.4f}',
+                'patience': f'{num_patient_epochs}/{patience}'
+            })
         
         # Early stopping
         if enable_loss_early_stop:
@@ -1341,44 +956,6 @@ def main(args):
     print(f"\n✅ Training completed! Best validation recall@100: {best_val_metric:.4f}")
     print(f"⏱️ Training time: {hours:02d}:{minutes:02d}:{seconds:02d}")
     print(f"🎯 Results saved to: {save_dir}")
-    # Optional inference with rerank
-    if getattr(args, 'do_infer', False) and getattr(args, 'rerank', False):
-        print("🔎 Running inference with KGE rerank...")
-        # choose split for inference
-        infer_split = getattr(args, 'infer_split', 'val')
-        if infer_split == 'val':
-            infer_set = val_set
-        else:
-            # build test set similarly to val
-            if (args.dataset == 'cwq' and _HAS_OPTIMIZED_DS):
-                weight_mode = 'none'
-                infer_set = OptimizedRetrieverDataset(
-                    config=config,
-                    split='test',
-                    freq_weight=args.freq_weight,
-                    weight_mode=weight_mode,
-                )
-            else:
-                infer_set = RetrieverDataset(
-                    config=config, split='test',
-                    skip_no_path=True,
-                    freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
-                    kge_shortest_path=args.kge_shortest_path,
-                    path_weight=(getattr(args, 'path_weight', None) is not None),
-                    path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
-                    kge_scorer=getattr(args, 'kge_scorer', None)
-                )
-        run_inference_with_rerank(
-            config=config,
-            device=device,
-            infer_set=infer_set,
-            model=model,
-            args=args,
-            save_dir=save_dir,
-            max_candidates=int(getattr(args, 'rerank_candidates', 500)),
-            top_k=int(getattr(args, 'infer_top_k', 100)),
-            split_name=infer_split,
-        )
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
@@ -1391,46 +968,19 @@ if __name__ == '__main__':
     parser.add_argument('-fwi', '--freq_weight_inv', action='store_true', help='Enable inverse frequency-based weighting.')
     parser.add_argument('-sc', '--spcount', action='store_true', help='Enable SP count-based weighting.')
     parser.add_argument('-sci', '--spcount_inv', action='store_true', help='Enable inverse SP count-based weighting.')
-    parser.add_argument('-sc_smooth', '--spcount_smooth', type=str, default='none', choices=['none', 'log', 'sqrt'], help='Smoothing for SP count weights.')
     
     parser.add_argument('-kbce', '--kge_bce_weight', action='store_true', help='Enable KGE model-based weighting.')
     parser.add_argument('-ksp', '--kge_shortest_path', action='store_true', help='SP by KGE score(affects shortest path triplet sets).')
-    parser.add_argument('-kge_reg', '--kge_regularization', action='store_true', help='Enable KGE model regularization loss term.')
-    parser.add_argument('-kge_reg_w', '--kge_regularization_weight', type=float, default=0.1, help='Weight for KGE regularization loss term.')
     # Generic path-based weighting (independent of KGE)
     parser.add_argument('-pw', '--path_weight', type=str, default=None, choices=['count', 'inv'], help='Path-based weighting across shortest paths: count or inv.')
     parser.add_argument('-km', '--kge_model', type=str, default='transe', 
-                       choices=['transe', 'distmult', 'complex', 'rotate'], 
+                       choices=['transe', 'distmult', 'complex', 'rotate', 'auto'], 
                        help='KGE model type to use for weighting.')
     parser.add_argument('-kwm', '--kge_weight_mode', type=str, default='prob_inv', 
                        choices=['score', 'score_inv', 'prob', 'prob_inv', 'raw', 'raw_inv'], 
                        help='KGE weight computation mode for BCE loss.')
     
     parser.add_argument('-esv', '--early_stop_val', type=str, default=None, choices=['none', 'and', 'or'], help='Early stop + validation metric.')
-    parser.add_argument('--exp_tag', type=str, default=None, help='Optional experiment tag appended to run name (e.g., grid).')
-    
-    # DDE control
-    parser.add_argument('--no_dde', action='store_true', help='Disable DDE (Dynamic Dense Embedding) in retriever training.')
-    
-    # Rerank functionality
-    parser.add_argument('--rerank', action='store_true', help='Enable rerank functionality using KGE model.')
-    parser.add_argument('--rerank_candidates', type=int, default=500, help='Number of candidate triplets for reranking.')
-    parser.add_argument('--rerank_kge_model', type=str, default='transe', 
-                       choices=['transe', 'distmult', 'complex', 'rotate'], 
-                       help='KGE model type for reranking.')
-    parser.add_argument('--rerank_kge_weight_mode', type=str, default='prob_inv', 
-                       choices=['score', 'score_inv', 'prob', 'prob_inv', 'raw', 'raw_inv'], 
-                       help='KGE weight computation mode for reranking.')
-    parser.add_argument('--do_infer', action='store_true', help='Run inference after training.')
-    parser.add_argument('--infer_split', type=str, default='val', choices=['val', 'test'], help='Split to run inference on.')
-    parser.add_argument('--infer_top_k', type=int, default=100, help='Top-k to output after KGE rerank.')
-    
-    # PRA (Path Ranking Algorithm) functionality
-    parser.add_argument('--use_pra', action='store_true', help='Enable Path Ranking Algorithm (PRA) for supervision signal.')
-    parser.add_argument('--pra_max_path_length', type=int, default=3, help='Maximum path length for PRA.')
-    parser.add_argument('--pra_max_paths', type=int, default=100, help='Maximum number of paths to consider in PRA.')
-    parser.add_argument('--pra_use_freq_weight', action='store_true', help='Use frequency weighting in PRA path scoring.')
-    
     args = parser.parse_args()
     
     main(args)

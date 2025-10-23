@@ -1,5 +1,5 @@
 """
-KGE-based triple weight scorer using PyKEEN TransE model
+KGE-based triple weight scorer using PyG KGE models
 """
 import torch
 import torch.nn as nn
@@ -9,19 +9,16 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 try:
-    from pykeen.models import TransE, DistMult, ComplEx, RotatE
-    from pykeen.triples import TriplesFactory
-    from pykeen.utils import resolve_device
-    import numpy as np
-    _HAS_PYKEEN = True
+    from torch_geometric.nn import TransE, DistMult, ComplEx, RotatE
+    _HAS_PYG = True
 except ImportError:
-    _HAS_PYKEEN = False
-    logging.warning("PyKEEN not available. KGE weight scoring will be disabled.")
+    _HAS_PYG = False
+    logging.warning("PyG not available. KGE weight scoring will be disabled.")
 
 class KGEWeightScorer:
     """
-    使用 PyKEEN 預訓練模型為 triples 計算權重
-    支持 TransE, DistMult, ComplEx 等模型
+    使用 PyG 預訓練模型為 triples 計算權重
+    支持 TransE, DistMult, ComplEx, RotatE 等模型
     """
     
     def __init__(self, 
@@ -32,18 +29,18 @@ class KGEWeightScorer:
                  weight_mode: str = 'score'):
         """
         Args:
-            kge_model_path: PyKEEN 模型路徑
-            kge_model_type: 模型類型 ('TransE', 'DistMult', 'ComplEx')
+            kge_model_path: PyG 模型路徑
+            kge_model_type: 模型類型 ('TransE', 'DistMult', 'ComplEx', 'RotatE')
             device: 計算設備
             freeze_kge: 是否凍結 KGE 模型參數
-            weight_mode: 權重計算模式 ('score', 'score_inv', 'prob', 'prob_inv')
+            weight_mode: 權重計算模式 ('score', 'score_inv', 'prob', 'prob_inv', 'raw', 'raw_inv')
         """
-        if not _HAS_PYKEEN:
-            raise ImportError("PyKEEN is required for KGE weight scoring. Please install it.")
+        if not _HAS_PYG:
+            raise ImportError("PyG is required for KGE weight scoring. Please install it.")
         
         self.kge_model_path = kge_model_path
         self.kge_model_type = kge_model_type
-        self.device = resolve_device(device)
+        self.device = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
         self.freeze_kge = freeze_kge
         self.weight_mode = weight_mode
         
@@ -66,74 +63,85 @@ class KGEWeightScorer:
         print(f"   Device: {self.device}")
         
     def _load_kge_model(self):
-        """加載預訓練的KGE模型"""
+        """加載預訓練的PyG KGE模型"""
         if not os.path.exists(self.kge_model_path):
             raise FileNotFoundError(f"KGE model not found at {self.kge_model_path}")
         
-        # 加載模型狀態
+        # 加載模型檢查點
         try:
-            checkpoint = torch.load(self.kge_model_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(self.kge_model_path, map_location=self.device)
         except Exception as e:
-            # 如果 weights_only=False 失敗，嘗試其他方法
-            print(f"Warning: Failed to load with weights_only=False: {e}")
             try:
-                checkpoint = torch.load(self.kge_model_path, map_location=self.device)
+                checkpoint = torch.load(self.kge_model_path, map_location='cpu')
             except Exception as e2:
                 raise RuntimeError(f"Failed to load KGE model from {self.kge_model_path}: {e2}")
         
-        # 如果是已載入的 PyKEEN 模型物件，直接返回
+        # 如果是已載入的 PyG 模型物件，直接返回
         try:
-            if hasattr(checkpoint, 'score_hrt') and hasattr(checkpoint, 'state_dict'):
+            if hasattr(checkpoint, 'score') and hasattr(checkpoint, 'state_dict'):
                 kge_model = checkpoint
                 try:
-                    kge_model = kge_model.to(self.device)
+                    kge_model.to(self.device)
                 except Exception:
                     pass
-                if self.freeze_kge:
-                    for param in kge_model.parameters():
-                        param.requires_grad = False
                 return kge_model
         except Exception:
             pass
         
-        # 根據模型類型創建模型實例
-        if self.kge_model_type == 'TransE':
-            model_class = TransE
-        elif self.kge_model_type == 'DistMult':
-            model_class = DistMult
-        elif self.kge_model_type == 'ComplEx':
-            model_class = ComplEx
-        elif self.kge_model_type == 'RotatE':
-            model_class = RotatE
-        else:
-            raise ValueError(f"Unsupported KGE model type: {self.kge_model_type}")
-        
-        # 從checkpoint中提取模型參數
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
+        # 從檢查點加載狀態字典
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
         else:
             state_dict = checkpoint
         
-        # 創建模型實例（需要實體和關係數量）
+        # 根據模型類型創建模型實例
+        model_class_map = {
+            'TransE': TransE,
+            'DistMult': DistMult,
+            'ComplEx': ComplEx,
+            'RotatE': RotatE
+        }
+        
+        model_class = model_class_map.get(self.kge_model_type)
+        if model_class is None:
+            raise ValueError(f"Unsupported KGE model type: {self.kge_model_type}")
+        
+        # 從狀態字典推斷模型參數
         num_entities = self._get_num_entities(state_dict)
         num_relations = self._get_num_relations(state_dict)
         embedding_dim = self._get_embedding_dim(state_dict)
         
-        # 創建虛擬的 triples factory 來滿足 PyKEEN 的要求
-        dummy_triples = np.array([['entity_0', 'relation_0', 'entity_0']])  # 單個虛擬三元組
-        triples_factory = TriplesFactory.from_labeled_triples(
-            dummy_triples,
-            entity_to_id={f'entity_{i}': i for i in range(num_entities)},
-            relation_to_id={f'relation_{i}': i for i in range(num_relations)}
-        )
+        # 創建 PyG KGE 模型實例
+        model_kwargs = {}
+        if self.kge_model_type == 'RotatE':
+            model_kwargs['margin'] = 9.0  # RotatE 默認 margin
         
         kge_model = model_class(
-            triples_factory=triples_factory,
-            embedding_dim=embedding_dim
+            num_nodes=num_entities,
+            num_relations=num_relations,
+            hidden_channels=embedding_dim,
+            **model_kwargs
         )
         
+        # 修復 ComplEx 和 RotatE 模型的權重加載問題
+        if self.kge_model_type in ['ComplEx', 'RotatE']:
+            # ComplEx 和 RotatE 都需要實部和虛部權重，如果只有實部，複製一份作為虛部
+            if 'node_emb.weight' in state_dict and 'node_emb_im.weight' not in state_dict:
+                state_dict['node_emb_im.weight'] = state_dict['node_emb.weight'].clone()
+            if 'rel_emb.weight' in state_dict and 'rel_emb_im.weight' not in state_dict:
+                state_dict['rel_emb_im.weight'] = state_dict['rel_emb.weight'].clone()
+        
         # 加載權重
-        kge_model.load_state_dict(state_dict)
+        try:
+            kge_model.load_state_dict(state_dict)
+        except Exception as e:
+            print(f"Warning: Failed to load complete state dict: {e}")
+            # 嘗試只加載存在的權重
+            model_dict = kge_model.state_dict()
+            filtered_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(filtered_dict)
+            kge_model.load_state_dict(model_dict)
+        
         kge_model.to(self.device)
         
         if self.freeze_kge:
@@ -144,7 +152,15 @@ class KGEWeightScorer:
     
     def _get_num_entities(self, state_dict: Dict) -> int:
         """從狀態字典中推斷實體數量"""
-        # PyKEEN 格式
+        # PyG 格式 - 查找實體嵌入層
+        for key in state_dict.keys():
+            if 'node_emb' in key and 'weight' in key:
+                return state_dict[key].shape[0]
+            elif 'entity_emb' in key and 'weight' in key:
+                return state_dict[key].shape[0]
+            elif 'node_emb_re' in key and 'weight' in key:  # ComplEx 實部
+                return state_dict[key].shape[0]
+        # 回退到 PyKEEN 格式
         if 'entity_representations.0._embeddings.weight' in state_dict:
             return state_dict['entity_representations.0._embeddings.weight'].shape[0]
         # 標準格式
@@ -155,7 +171,15 @@ class KGEWeightScorer:
     
     def _get_num_relations(self, state_dict: Dict) -> int:
         """從狀態字典中推斷關係數量"""
-        # PyKEEN 格式
+        # PyG 格式 - 查找關係嵌入層
+        for key in state_dict.keys():
+            if 'rel_emb' in key and 'weight' in key:
+                return state_dict[key].shape[0]
+            elif 'relation_emb' in key and 'weight' in key:
+                return state_dict[key].shape[0]
+            elif 'rel_emb_re' in key and 'weight' in key:  # ComplEx 實部
+                return state_dict[key].shape[0]
+        # 回退到 PyKEEN 格式
         if 'relation_representations.0._embeddings.weight' in state_dict:
             return state_dict['relation_representations.0._embeddings.weight'].shape[0]
         # 標準格式
@@ -166,7 +190,15 @@ class KGEWeightScorer:
     
     def _get_embedding_dim(self, state_dict: Dict) -> int:
         """從狀態字典中推斷嵌入維度"""
-        # PyKEEN 格式
+        # PyG 格式 - 查找實體嵌入層
+        for key in state_dict.keys():
+            if 'node_emb' in key and 'weight' in key:
+                return state_dict[key].shape[1]
+            elif 'entity_emb' in key and 'weight' in key:
+                return state_dict[key].shape[1]
+            elif 'node_emb_re' in key and 'weight' in key:  # ComplEx 實部
+                return state_dict[key].shape[1]
+        # 回退到 PyKEEN 格式
         if 'entity_representations.0._embeddings.weight' in state_dict:
             return state_dict['entity_representations.0._embeddings.weight'].shape[1]
         # 標準格式
@@ -175,22 +207,12 @@ class KGEWeightScorer:
         else:
             raise ValueError("Cannot determine embedding dimension from state dict")
     
-    def set_entity_mapping(self, entity_to_id: Dict[str, int]):
-        """設置實體名稱到ID的映射"""
-        self.entity_to_id = entity_to_id
-        self.id_to_entity = {v: k for k, v in entity_to_id.items()}
-    
-    def set_relation_mapping(self, relation_to_id: Dict[str, int]):
-        """設置關係名稱到ID的映射"""
-        self.relation_to_id = relation_to_id
-        self.id_to_relation = {v: k for k, v in relation_to_id.items()}
-    
     def compute_triple_weights(self, 
                               h_ids: torch.Tensor, 
                               r_ids: torch.Tensor, 
                               t_ids: torch.Tensor) -> torch.Tensor:
         """
-        計算三元組的KGE權重
+        計算三元組的權重
         
         Args:
             h_ids: 頭實體ID張量 [num_triples]
@@ -198,10 +220,10 @@ class KGEWeightScorer:
             t_ids: 尾實體ID張量 [num_triples]
             
         Returns:
-            weights: KGE權重張量 [num_triples]
+            weights: 三元組權重張量 [num_triples]
         """
         if not self.enabled:
-            return torch.ones_like(h_ids, dtype=torch.float32, device=h_ids.device)
+            return torch.ones(len(h_ids), device=h_ids.device)
         
         device = h_ids.device
         
@@ -211,7 +233,7 @@ class KGEWeightScorer:
         t_ids_kge = t_ids.to(self.device)
         
         # 取得 KGE 模型的實體/關係大小
-        num_entities = getattr(self.kge_model, 'num_entities', None)
+        num_entities = getattr(self.kge_model, 'num_nodes', None)
         num_relations = getattr(self.kge_model, 'num_relations', None)
         try:
             if num_entities is None and hasattr(self.kge_model, 'entity_representations'):
@@ -222,124 +244,137 @@ class KGEWeightScorer:
                 num_relations = getattr(remb, 'num_embeddings', None)
         except Exception:
             pass
-
+        
         # 建立預設權重為1
-        weights_full = torch.ones_like(h_ids, dtype=torch.float32, device=device)
-
-        # 有邊界資訊時，先篩選合法索引
+        weights = torch.ones(len(h_ids), device=device)
+        
+        # 篩選合法索引
         if (num_entities is not None) and (num_relations is not None):
             valid_mask = (h_ids_kge >= 0) & (h_ids_kge < num_entities) \
                          & (t_ids_kge >= 0) & (t_ids_kge < num_entities) \
                          & (r_ids_kge >= 0) & (r_ids_kge < num_relations)
         else:
-            # 不知道邊界，就全部嘗試
             valid_mask = torch.ones_like(h_ids_kge, dtype=torch.bool)
-
+        
         if valid_mask.any():
             with torch.no_grad() if self.freeze_kge else torch.enable_grad():
-                hrt_batch = torch.stack([
-                    h_ids_kge[valid_mask],
-                    r_ids_kge[valid_mask],
-                    t_ids_kge[valid_mask]
-                ], dim=1)
-                # 計算三元組分數
-                kge_scores = self.kge_model.score_hrt(hrt_batch)
+                # 使用 PyG 的 loss 方法的負值作為分數
+                try:
+                    kge_loss = self.kge_model.loss(
+                        head_index=h_ids_kge[valid_mask],
+                        rel_type=r_ids_kge[valid_mask],
+                        tail_index=t_ids_kge[valid_mask]
+                    )
+                    kge_scores = -kge_loss  # 負損失作為分數
+                except Exception as e:
+                    print(f"Warning: Failed to compute loss with PyG model: {e}")
+                    # 如果損失計算失敗，使用隨機分數
+                    kge_scores = torch.zeros(len(h_ids_kge[valid_mask]), device=self.device)
             
             # 根據權重模式轉換分數為權重
             if self.weight_mode == 'score':
-                # kge model分數越大越好
-                weights = torch.sigmoid(kge_scores)  # 轉換到 [0, 1]
-                weights = weights * 2.0  # 縮放到 [0, 2]
-                
+                weights[valid_mask] = kge_scores
             elif self.weight_mode == 'score_inv':
-                # kge model分數越小越好
-                weights = torch.sigmoid(-kge_scores)  # 分數越低權重越高
-                weights = weights * 2.0  # 縮放到 [0, 2]
-                
+                weights[valid_mask] = 1.0 / (kge_scores + 1e-8)
             elif self.weight_mode == 'prob':
-                # kge model分數越大越好
-                weights = torch.sigmoid(kge_scores)
-                
+                # 使用 sigmoid 將分數轉換為概率
+                probs = torch.sigmoid(kge_scores)
+                weights[valid_mask] = probs
             elif self.weight_mode == 'prob_inv':
-                # kge model分數越小越好
-                weights = torch.sigmoid(-kge_scores)
-                
+                probs = torch.sigmoid(kge_scores)
+                weights[valid_mask] = 1.0 / (probs + 1e-8)
             elif self.weight_mode == 'raw':
-                # kge model分數越大越好
-                weights = kge_scores
-                
+                # 直接使用原始分數（可能為負）
+                weights[valid_mask] = kge_scores
             elif self.weight_mode == 'raw_inv':
-                # kge model分數越小越好
-                weights = -kge_scores
-                
+                weights[valid_mask] = 1.0 / (kge_scores + 1e-8)
             else:
-                raise ValueError(f"Unsupported weight mode: {self.weight_mode}")
-
-            # 將有效權重放回整體張量（確保為1D）
-            weights_full = weights_full.clone()
-            if weights.dim() > 1 and weights.shape[-1] == 1:
-                weights = weights.squeeze(-1)
-            weights_full[valid_mask] = weights
-
-        return weights_full
-    
-    def compute_batch_triple_weights(self, 
-                                   h_id_tensors: List[torch.Tensor],
-                                   r_id_tensors: List[torch.Tensor], 
-                                   t_id_tensors: List[torch.Tensor]) -> List[torch.Tensor]:
-        """
-        計算批次中每個樣本的三元組權重
+                # 默認使用分數
+                weights[valid_mask] = kge_scores
         
-        Args:
-            h_id_tensors: 頭實體ID張量列表
-            r_id_tensors: 關係ID張量列表
-            t_id_tensors: 尾實體ID張量列表
-            
-        Returns:
-            weights_list: 權重張量列表
-        """
-        if not self.enabled:
-            return [torch.ones_like(h, dtype=torch.float32) for h in h_id_tensors]
-        
-        weights_list = []
-        
-        for h_ids, r_ids, t_ids in zip(h_id_tensors, r_id_tensors, t_id_tensors):
-            if len(h_ids) == 0:
-                weights_list.append(torch.tensor([], dtype=torch.float32, device=h_ids.device))
-                continue
-            
-            weights = self.compute_triple_weights(h_ids, r_ids, t_ids)
-            weights_list.append(weights)
-        
-        return weights_list
-    
-    def disable(self):
-        """禁用KGE權重計算"""
-        self.enabled = False
+        return weights
     
     def enable(self):
         """啟用KGE權重計算"""
         self.enabled = True
+    
+    def compute_regularization_loss(self, 
+                                  h_ids: torch.Tensor, 
+                                  r_ids: torch.Tensor, 
+                                  t_ids: torch.Tensor) -> torch.Tensor:
+        """
+        計算 KGE regularization loss
+        
+        Args:
+            h_ids: 頭實體ID張量 [num_triples]
+            r_ids: 關係ID張量 [num_triples] 
+            t_ids: 尾實體ID張量 [num_triples]
+            
+        Returns:
+            reg_loss: KGE regularization loss 標量
+        """
+        if not self.enabled:
+            return torch.tensor(0.0, device=h_ids.device, requires_grad=True)
+        
+        device = h_ids.device
+        
+        # 將ID張量移動到KGE模型設備
+        h_ids_kge = h_ids.to(self.device)
+        r_ids_kge = r_ids.to(self.device)
+        t_ids_kge = t_ids.to(self.device)
+        
+        # 取得 KGE 模型的實體/關係大小
+        num_entities = getattr(self.kge_model, 'num_nodes', None)
+        num_relations = getattr(self.kge_model, 'num_relations', None)
+
+        # 篩選合法索引
+        if (num_entities is not None) and (num_relations is not None):
+            valid_mask = (h_ids_kge >= 0) & (h_ids_kge < num_entities) \
+                         & (t_ids_kge >= 0) & (t_ids_kge < num_entities) \
+                         & (r_ids_kge >= 0) & (r_ids_kge < num_relations)
+        else:
+            valid_mask = torch.ones_like(h_ids_kge, dtype=torch.bool)
+
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # 計算 KGE loss 作為 regularization
+        with torch.enable_grad():
+            try:
+                kge_loss = self.kge_model.loss(
+                    head_index=h_ids_kge[valid_mask],
+                    rel_type=r_ids_kge[valid_mask],
+                    tail_index=t_ids_kge[valid_mask]
+                )
+                # 將 KGE loss 作為 regularization term
+                # 使用負值，因為我們希望 KGE 分數越高越好（loss 越低越好）
+                reg_loss = -kge_loss.mean()
+                
+            except Exception as e:
+                print(f"Warning: Failed to compute KGE regularization loss: {e}")
+                reg_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        return reg_loss
 
 
-def create_kge_weight_scorer(kge_model_path: str, 
-                           kge_model_type: str = 'TransE',
+def create_kge_weight_scorer(kge_model_path: str,
+                           kge_model_type: str,
                            device: str = 'cuda',
                            weight_mode: str = 'score') -> Optional[KGEWeightScorer]:
     """
-    創建 KGE 權重計算器的便捷函數
+    創建 KGE 權重計算器
     
     Args:
-        kge_model_path: PyKEEN 模型路徑
+        kge_model_path: PyG 模型路徑
         kge_model_type: 模型類型
         device: 計算設備
         weight_mode: 權重計算模式
         
     Returns:
-        KGEWeightScorer 實例或 None（如果 PyKEEN 不可用）
+        KGEWeightScorer 實例或 None（如果 PyG 不可用）
     """
-    if not _HAS_PYKEEN:
-        logging.warning("PyKEEN not available. KGE weight scoring disabled.")
+    if not _HAS_PYG:
+        logging.warning("PyG not available. KGE weight scoring disabled.")
         return None
     
     try:

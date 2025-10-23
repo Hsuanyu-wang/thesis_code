@@ -1,8 +1,6 @@
 ###################################################################//
-#  cpt7
-# + no_dde
-# + rerank
-# + PRA (Path Ranking Algorithm)
+# cpt6
+# + kge_regularization
 ###################################################################\\
 import numpy as np
 import os
@@ -28,84 +26,6 @@ except Exception:
 from src.model.retriever import Retriever
 from src.model.kge_weight_scorer import create_kge_weight_scorer
 from src.setup import set_seed, prepare_sample
-
-@torch.no_grad()
-def run_inference_with_rerank(config, device, infer_set, model, args, save_dir: str,
-                              max_candidates: int = 500, top_k: int = 100, split_name: str = 'val'):
-    """Run inference: select many candidates via retriever, then rerank by a KGE model.
-
-    Saves a dict keyed by sample id with fields: question, scored_triples[(h,r,t,score)], q/a entities.
-    """
-    model.eval()
-
-    # Build KGE scorer for reranking
-    kge_model_path, kge_model_type = _get_kge_model_info(args.rerank_kge_model, args.dataset)
-    kge_scorer = create_kge_weight_scorer(
-        kge_model_path=kge_model_path,
-        kge_model_type=kge_model_type,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        weight_mode=args.rerank_kge_weight_mode
-    )
-
-    pred_dict = dict()
-    pbar = tqdm(range(len(infer_set)), desc=f"Inference+Rerank ({split_name})")
-    for i in pbar:
-        raw_sample = infer_set[i]
-        sample = collate_retriever([raw_sample])
-        h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs, \
-            num_non_text_entities, relation_embs, topic_entity_one_hot, \
-            target_triple_probs, a_entity_id_list = prepare_sample(device, sample)
-
-        entity_list = raw_sample['text_entity_list'] + raw_sample['non_text_entity_list']
-        relation_list = raw_sample['relation_list']
-
-        scored_triples = []
-        if len(h_id_tensor) != 0:
-            # 1) Retriever scores
-            retriever_logits = model.forward_legacy(
-                h_id_tensor, r_id_tensor, t_id_tensor, q_emb, entity_embs,
-                num_non_text_entities, relation_embs, topic_entity_one_hot
-            ).reshape(-1)
-            retriever_scores = torch.sigmoid(retriever_logits)
-            # 2) Take top-N candidates by retriever
-            topN = min(int(max_candidates), int(retriever_scores.numel()))
-            topN_results = torch.topk(retriever_scores, topN)
-            cand_idx = topN_results.indices
-
-            # 3) KGE rerank on those candidates
-            h_sel = h_id_tensor[cand_idx]
-            r_sel = r_id_tensor[cand_idx]
-            t_sel = t_id_tensor[cand_idx]
-            kge_scores = kge_scorer.compute_triple_weights(h_sel, r_sel, t_sel)
-
-            # 4) Final top-k by KGE score
-            final_k = min(int(top_k), int(kge_scores.numel()))
-            final_idx_in_cands = torch.topk(kge_scores, final_k).indices
-            chosen_idx = cand_idx[final_idx_in_cands]
-            final_scores = kge_scores[final_idx_in_cands].detach().cpu().tolist()
-
-            for j, triple_id in enumerate(chosen_idx.cpu().tolist()):
-                scored_triples.append((
-                    entity_list[h_id_tensor[triple_id].item()],
-                    relation_list[r_id_tensor[triple_id].item()],
-                    entity_list[t_id_tensor[triple_id].item()],
-                    final_scores[j]
-                ))
-
-        sample_dict = {
-            'question': raw_sample.get('question'),
-            'scored_triples': scored_triples,
-            'q_entity': raw_sample.get('q_entity'),
-            'q_entity_in_graph': [entity_list[e_id] for e_id in raw_sample.get('q_entity_id_list', [])],
-            'a_entity': raw_sample.get('a_entity'),
-            'a_entity_in_graph': [entity_list[e_id] for e_id in raw_sample.get('a_entity_id_list', [])],
-            'max_path_length': raw_sample.get('max_path_length'),
-        }
-        pred_dict[raw_sample['id']] = sample_dict
-
-    out_path = os.path.join(save_dir, f'infer_{split_name}_rerank.pt')
-    torch.save(pred_dict, out_path)
-    print(f"💾 Inference+Rerank saved to: {out_path}")
 
 @torch.no_grad()
 def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_epochs=None):
@@ -139,11 +59,6 @@ def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_ep
             target_triple_probs_device = target_triple_probs.to(device).unsqueeze(-1)
             if args.spcount:
                 sp_weights = target_triple_probs_device.clone()
-                # smoothing on counts
-                if getattr(args, 'spcount_smooth', 'none') == 'log':
-                    sp_weights = torch.log1p(sp_weights)
-                elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                    sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
                 sp_weights = sp_weights + 1.0
                 positive_mask = (target_triple_probs_device > 0).float()
                 bce_loss = F.binary_cross_entropy_with_logits(
@@ -153,11 +68,6 @@ def eval_epoch(config, device, data_loader, model, args=None, epoch=None, num_ep
             elif args.spcount_inv:
                 sp_weights = target_triple_probs_device.clone()
                 positive_mask = (target_triple_probs_device > 0).float()
-                # smoothing on counts before inversion
-                if getattr(args, 'spcount_smooth', 'none') == 'log':
-                    sp_weights = torch.log1p(sp_weights)
-                elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                    sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
                 inv_weights = torch.where(
                     sp_weights > 0, 
                     1.0 / (sp_weights + 1.0),
@@ -264,11 +174,6 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
             # target_triple_probs 已經包含了每個 triple 在 shortest path 中出現的次數
             # 我們將這個計數+1作為權重（避免0權重）
             sp_weights = target_triple_probs.clone()
-            # smoothing on counts
-            if getattr(args, 'spcount_smooth', 'none') == 'log':
-                sp_weights = torch.log1p(sp_weights)
-            elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
             sp_weights = sp_weights + 1.0  # 基礎權重為1，然後加上 shortest path 計數
             
             # 對於正樣本和負樣本分別處理
@@ -291,11 +196,6 @@ def train_epoch(device, train_loader, model, optimizer, args, epoch=None, num_ep
             positive_mask = (target_triple_probs > 0).float()
             
             # 計算倒數權重，避免除零
-            # smoothing on counts before inversion
-            if getattr(args, 'spcount_smooth', 'none') == 'log':
-                sp_weights = torch.log1p(sp_weights)
-            elif getattr(args, 'spcount_smooth', 'none') == 'sqrt':
-                sp_weights = torch.sqrt(torch.clamp(sp_weights, min=0.0))
             inv_weights = torch.where(
                 sp_weights > 0, 
                 1.0 / (sp_weights + 1.0),  # 倒數權重
@@ -768,28 +668,27 @@ def _get_kge_model_info(model_type, dataset_name):
     
     if model_type == 'transe':
         # 使用對應數據集的 TransE 模型
-        model_path = os.path.join(kge_models_dir, f'transe_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, f'transe_{dataset_name}_best.pt')
         if os.path.exists(model_path):
             return model_path, 'TransE'
     
     elif model_type == 'distmult':
-        model_path = os.path.join(kge_models_dir, f'distmult_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, f'distmult_{dataset_name}_best.pt')
         if os.path.exists(model_path):
             return model_path, 'DistMult'
     
     elif model_type == 'complex':
-        model_path = os.path.join(kge_models_dir, f'complex_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, f'complex_{dataset_name}_best.pt')
         if os.path.exists(model_path):
             return model_path, 'ComplEx'
     
     elif model_type == 'rotate':
-        model_path = os.path.join(kge_models_dir, f'rotate_{dataset_name}_epoch_200.pt')
+        model_path = os.path.join(kge_models_dir, f'rotate_{dataset_name}_best.pt')
         if os.path.exists(model_path):
             return model_path, 'RotatE'
     
     # 預設回退到 TransE
-    print(f"🔍 No model found for {model_type} on {dataset_name}, using default model: {os.path.join(kge_models_dir, f'transe_{dataset_name}_epoch_200.pt')}")
-    return os.path.join(kge_models_dir, f'transe_{dataset_name}_epoch_200.pt'), 'TransE'
+    return os.path.join(kge_models_dir, f'transe_{dataset_name}_best.pt'), 'TransE'
 
 ###################################################################//
 def check_and_warn_resources(args):
@@ -832,12 +731,6 @@ def main(args):
     if args.kge_regularization:
         print(f"   KGE regularization weight: {args.kge_regularization_weight}")
     print(f"   Path weight: {('none' if getattr(args, 'path_weight', None) is None else args.path_weight)}")
-    print(f"   Use DDE: {not args.no_dde}")
-    print(f"   Use PRA: {args.use_pra}")
-    if args.use_pra:
-        print(f"   PRA max path length: {args.pra_max_path_length}")
-        print(f"   PRA max paths: {args.pra_max_paths}")
-        print(f"   PRA use freq weight: {args.pra_use_freq_weight}")
     if args.kge_bce_weight or args.kge_shortest_path or args.kge_regularization:
         print(f"   KGE model: {args.kge_model}")
         print(f"   KGE weight mode: {args.kge_weight_mode}")
@@ -928,19 +821,9 @@ def main(args):
         feature_tags.append('pw_inv' if args.path_weight == 'inv' else 'pw')
     if args.use_dropout:
         feature_tags.append(f'drop{str(args.dropout_rate).replace(".", "_")}')
-    if args.no_dde:
-        feature_tags.append('no_dde')
-    if args.use_pra:
-        pra_tag = f'pra_l{args.pra_max_path_length}_p{args.pra_max_paths}'
-        if args.pra_use_freq_weight:
-            pra_tag += '_freq'
-        feature_tags.append(pra_tag)
     # Append early stop mode tag when enabled
     if args.early_stop_val in ('and', 'or'):
         feature_tags.append(f'esv_{args.early_stop_val}')
-    # Insert explicit experiment tag first (right after date), when provided
-    if getattr(args, 'exp_tag', None):
-        feature_tags = [str(args.exp_tag)] + feature_tags
         
     exp_name = exp_name_base if not feature_tags else f"{exp_name_base}_{'_'.join(feature_tags)}"
     
@@ -1044,43 +927,22 @@ def main(args):
                 num_workers=2,
             )
     else:
-        # 檢查是否使用PRA
-        if args.use_pra:
-            from src.dataset.retriever_pra import RetrieverDatasetPRA
-            print("🔍 Using Path Ranking Algorithm (PRA) for supervision signal")
-            train_set = RetrieverDatasetPRA(
-                config=config, split='train', 
-                skip_no_path=True,
-                use_pra=True,
-                pra_max_path_length=args.pra_max_path_length,
-                pra_max_paths=args.pra_max_paths,
-                pra_use_freq_weight=args.pra_use_freq_weight
-            )
-            val_set = RetrieverDatasetPRA(
-                config=config, split='val', 
-                skip_no_path=True,
-                use_pra=True,
-                pra_max_path_length=args.pra_max_path_length,
-                pra_max_paths=args.pra_max_paths,
-                pra_use_freq_weight=args.pra_use_freq_weight
-            )
-        else:
-            train_set = RetrieverDataset(
-                config=config, split='train', 
-                skip_no_path=True,
-                freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
-                kge_shortest_path=args.kge_shortest_path,
-                path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
-                kge_scorer=kge_scorer
-            )
-            val_set = RetrieverDataset(
-                config=config, split='val', 
-                skip_no_path=True,
-                freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
-                kge_shortest_path=args.kge_shortest_path,
-                path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
-                kge_scorer=kge_scorer
-            )
+        train_set = RetrieverDataset(
+            config=config, split='train', 
+            skip_no_path=True,
+            freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
+            kge_shortest_path=args.kge_shortest_path,
+            path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
+            kge_scorer=kge_scorer
+        )
+        val_set = RetrieverDataset(
+            config=config, split='val', 
+            skip_no_path=True,
+            freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
+            kge_shortest_path=args.kge_shortest_path,
+            path_weight=(getattr(args, 'path_weight', None) is not None), path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
+            kge_scorer=kge_scorer
+        )
         print(f"   Training samples: {len(train_set)}")
         print(f"   Validation samples: {len(val_set)}")
         train_loader = DataLoader(train_set, batch_size=1, shuffle=True, collate_fn=collate_retriever)
@@ -1088,41 +950,7 @@ def main(args):
     
     emb_size = train_set[0]['q_emb'].shape[-1]
     print(f"🧠 Creating model with embedding size: {emb_size}")
-    
-    # Modify retriever config to disable DDE if requested
-    retriever_config = config['retriever'].copy()
-    if args.no_dde:
-        print("🚫 DDE disabled - using simplified retriever architecture")
-        print("   This will reduce model complexity and may improve training speed")
-        # Set DDE parameters to disable it
-        retriever_config['DDE_kwargs'] = {
-            'num_rounds': 0,
-            'num_reverse_rounds': 0
-        }
-        # Verify that DDE is properly disabled
-        if retriever_config['DDE_kwargs']['num_rounds'] != 0 or retriever_config['DDE_kwargs']['num_reverse_rounds'] != 0:
-            print("⚠️  WARNING: DDE parameters not properly set to 0")
-        else:
-            print("   ✅ DDE parameters successfully set to 0")
-    
-    model = Retriever(emb_size, **retriever_config).to(device)
-    
-    # Display model parameter count
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"📊 Model parameters: {total_params:,} total, {trainable_params:,} trainable")
-    
-    if args.no_dde:
-        # Calculate approximate parameter reduction
-        dde_params = 0  # DDE parameters are 0 when disabled
-        print(f"   DDE parameters: {dde_params} (disabled)")
-    else:
-        # Estimate DDE parameters (this is approximate)
-        dde_rounds = retriever_config['DDE_kwargs']['num_rounds']
-        dde_reverse_rounds = retriever_config['DDE_kwargs']['num_reverse_rounds']
-        dde_params = (dde_rounds + dde_reverse_rounds) * 2 * 2  # Approximate
-        print(f"   DDE parameters: ~{dde_params} (enabled)")
-    
+    model = Retriever(emb_size, **config['retriever']).to(device)
     optimizer = Adam(model.parameters(), **config['optimizer'])
 
     # Create results directory
@@ -1138,10 +966,6 @@ def main(args):
     print(f"   Epochs: {num_epochs}")
     print(f"   Patience: {patience}")
     print(f"   K values for evaluation: {config['eval']['k_list']}")
-    if args.no_dde:
-        print(f"   Architecture: Simplified (DDE disabled)")
-    else:
-        print(f"   Architecture: Full (DDE enabled)")
     print("===============================")
     ###################################################################\\
         
@@ -1255,7 +1079,6 @@ def main(args):
                 if args.kge_regularization:
                     f.write(f"  KGE regularization weight: {args.kge_regularization_weight}\n")
                 f.write(f"  Path weight: {('none' if getattr(args, 'path_weight', None) is None else args.path_weight)}\n")
-                f.write(f"  Use DDE: {not args.no_dde}\n")
                 if args.kge_bce_weight or args.kge_shortest_path or args.kge_regularization:
                     f.write(f"  KGE model: {args.kge_model}\n")
                     f.write(f"  KGE weight mode: {args.kge_weight_mode}\n")
@@ -1341,44 +1164,6 @@ def main(args):
     print(f"\n✅ Training completed! Best validation recall@100: {best_val_metric:.4f}")
     print(f"⏱️ Training time: {hours:02d}:{minutes:02d}:{seconds:02d}")
     print(f"🎯 Results saved to: {save_dir}")
-    # Optional inference with rerank
-    if getattr(args, 'do_infer', False) and getattr(args, 'rerank', False):
-        print("🔎 Running inference with KGE rerank...")
-        # choose split for inference
-        infer_split = getattr(args, 'infer_split', 'val')
-        if infer_split == 'val':
-            infer_set = val_set
-        else:
-            # build test set similarly to val
-            if (args.dataset == 'cwq' and _HAS_OPTIMIZED_DS):
-                weight_mode = 'none'
-                infer_set = OptimizedRetrieverDataset(
-                    config=config,
-                    split='test',
-                    freq_weight=args.freq_weight,
-                    weight_mode=weight_mode,
-                )
-            else:
-                infer_set = RetrieverDataset(
-                    config=config, split='test',
-                    skip_no_path=True,
-                    freq_weight=args.freq_weight, freq_weight_inv=args.freq_weight_inv,
-                    kge_shortest_path=args.kge_shortest_path,
-                    path_weight=(getattr(args, 'path_weight', None) is not None),
-                    path_weight_inv=(getattr(args, 'path_weight', None) == 'inv'),
-                    kge_scorer=getattr(args, 'kge_scorer', None)
-                )
-        run_inference_with_rerank(
-            config=config,
-            device=device,
-            infer_set=infer_set,
-            model=model,
-            args=args,
-            save_dir=save_dir,
-            max_candidates=int(getattr(args, 'rerank_candidates', 500)),
-            top_k=int(getattr(args, 'infer_top_k', 100)),
-            split_name=infer_split,
-        )
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
@@ -1391,7 +1176,6 @@ if __name__ == '__main__':
     parser.add_argument('-fwi', '--freq_weight_inv', action='store_true', help='Enable inverse frequency-based weighting.')
     parser.add_argument('-sc', '--spcount', action='store_true', help='Enable SP count-based weighting.')
     parser.add_argument('-sci', '--spcount_inv', action='store_true', help='Enable inverse SP count-based weighting.')
-    parser.add_argument('-sc_smooth', '--spcount_smooth', type=str, default='none', choices=['none', 'log', 'sqrt'], help='Smoothing for SP count weights.')
     
     parser.add_argument('-kbce', '--kge_bce_weight', action='store_true', help='Enable KGE model-based weighting.')
     parser.add_argument('-ksp', '--kge_shortest_path', action='store_true', help='SP by KGE score(affects shortest path triplet sets).')
@@ -1407,30 +1191,6 @@ if __name__ == '__main__':
                        help='KGE weight computation mode for BCE loss.')
     
     parser.add_argument('-esv', '--early_stop_val', type=str, default=None, choices=['none', 'and', 'or'], help='Early stop + validation metric.')
-    parser.add_argument('--exp_tag', type=str, default=None, help='Optional experiment tag appended to run name (e.g., grid).')
-    
-    # DDE control
-    parser.add_argument('--no_dde', action='store_true', help='Disable DDE (Dynamic Dense Embedding) in retriever training.')
-    
-    # Rerank functionality
-    parser.add_argument('--rerank', action='store_true', help='Enable rerank functionality using KGE model.')
-    parser.add_argument('--rerank_candidates', type=int, default=500, help='Number of candidate triplets for reranking.')
-    parser.add_argument('--rerank_kge_model', type=str, default='transe', 
-                       choices=['transe', 'distmult', 'complex', 'rotate'], 
-                       help='KGE model type for reranking.')
-    parser.add_argument('--rerank_kge_weight_mode', type=str, default='prob_inv', 
-                       choices=['score', 'score_inv', 'prob', 'prob_inv', 'raw', 'raw_inv'], 
-                       help='KGE weight computation mode for reranking.')
-    parser.add_argument('--do_infer', action='store_true', help='Run inference after training.')
-    parser.add_argument('--infer_split', type=str, default='val', choices=['val', 'test'], help='Split to run inference on.')
-    parser.add_argument('--infer_top_k', type=int, default=100, help='Top-k to output after KGE rerank.')
-    
-    # PRA (Path Ranking Algorithm) functionality
-    parser.add_argument('--use_pra', action='store_true', help='Enable Path Ranking Algorithm (PRA) for supervision signal.')
-    parser.add_argument('--pra_max_path_length', type=int, default=3, help='Maximum path length for PRA.')
-    parser.add_argument('--pra_max_paths', type=int, default=100, help='Maximum number of paths to consider in PRA.')
-    parser.add_argument('--pra_use_freq_weight', action='store_true', help='Use frequency weighting in PRA path scoring.')
-    
     args = parser.parse_args()
     
     main(args)
